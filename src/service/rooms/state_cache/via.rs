@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+
 use futures::{Stream, StreamExt, stream::iter};
 use ruma::{
 	OwnedServerName, RoomId, ServerName,
@@ -48,32 +50,29 @@ pub async fn servers_route_via(&self, room_id: &RoomId) -> Result<Vec<OwnedServe
 		.state_accessor
 		.room_state_get_content(room_id, &StateEventType::RoomPowerLevels, "")
 		.await
-		.map(|content: RoomPowerLevelsEventContent| {
+		.ok()
+		.and_then(|content: RoomPowerLevelsEventContent| {
 			content
 				.users
-				.iter()
+				.into_iter()
 				.max_by_key(|(_, power)| *power)
-				.and_then(|x| (x.1 >= &int!(50)).then_some(x))
-				.map(|(user, _power)| user.server_name().to_owned())
+				.filter(|(_, power)| *power >= int!(50))
+				.map(|(user, _)| user.server_name().to_owned())
 		});
 
-	let mut servers: Vec<OwnedServerName> = self
+	let popular_servers = self
 		.room_members(room_id)
 		.counts_by(|user| user.server_name().to_owned())
 		.await
 		.into_iter()
-		.sorted_by_key(|(_, users)| *users)
-		.map(|(server, _)| server)
-		.rev()
+		.sorted_by_key(|(_, users)| Reverse(*users))
+		.map(|(server, _)| server);
+
+	Ok(most_powerful_user_server
+		.into_iter()
+		.chain(popular_servers)
 		.take(5)
-		.collect();
-
-	if let Ok(Some(server)) = most_powerful_user_server {
-		servers.insert(0, server);
-		servers.truncate(5);
-	}
-
-	Ok(servers)
+		.collect())
 }
 
 #[implement(super::Service)]

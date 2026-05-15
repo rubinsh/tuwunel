@@ -1073,6 +1073,20 @@ async fn load_joined_room(
 		})
 		.unwrap_or(Vec::new());
 
+	let custom_ephemeral_events = async {
+		let count = services.ephemeral.last_update(room_id).await;
+		if count <= since {
+			return Vec::<Raw<AnySyncEphemeralRoomEvent>>::new();
+		}
+		// Cap at next_batch so a PUT racing this response can't be
+		// delivered both here and in the subsequent /sync that uses
+		// next_batch as `since`.
+		services
+			.ephemeral
+			.raw_events_for_sync(room_id, since, next_batch)
+			.await
+	};
+
 	let keys_changed = services
 		.users
 		.room_keys_changed(room_id, since, Some(next_batch))
@@ -1147,11 +1161,13 @@ async fn load_joined_room(
 		(typing_events, private_read_events),
 		(notification_count, highlight_count, thread_counts),
 		(device_list_updates, left_encrypted_users),
-	) = join4(
+		custom_ephemeral_events,
+	) = join5(
 		join(room_events, account_data_events),
 		join(typing_events, private_read_events),
 		join3(notification_count, highlight_count, thread_counts),
 		device_list_updates,
+		custom_ephemeral_events,
 	)
 	.boxed()
 	.await;
@@ -1186,6 +1202,7 @@ async fn load_joined_room(
 		.map(at!(1))
 		.chain(typing_events)
 		.chain(private_read_events.into_iter().flatten())
+		.chain(custom_ephemeral_events)
 		.collect();
 
 	let thread_counts = thread_counts.unwrap_or_default();

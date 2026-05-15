@@ -11,7 +11,7 @@ use std::str::FromStr;
 use axum::{
 	Router,
 	response::{IntoResponse, Redirect},
-	routing::{any, get, post},
+	routing::{any, get, post, put},
 };
 pub use client_ip::ConfiguredIpSource;
 use http::{Uri, uri};
@@ -206,6 +206,10 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 		)
 		.ruma_route(&client::room_initial_sync_route)
 		.route("/_tuwunel/server_version", get(client::tuwunel_server_version))
+		.route(
+			"/_tuwunel/ephemeral/{event_type}/{room_id}",
+			put(client::put_ephemeral_event_route),
+		)
 		// OIDC server endpoints (next-gen auth, MSC2965/2964/2966/2967)
 		.route("/_tuwunel/oidc/registration", post(oidc::registration_route))
 		.route("/_tuwunel/oidc/authorize", get(oidc::authorize_route))

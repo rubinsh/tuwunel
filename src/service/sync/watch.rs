@@ -152,6 +152,22 @@ where
 			}
 			.boxed(),
 		);
+
+		// Custom ephemeral events (matrix-channel `_tuwunel/ephemeral`):
+		// same broadcast-subscribe pattern as typing so PUTs wake idle /sync.
+		let mut ephemeral_rx = self.services.ephemeral.update_sender.subscribe();
+
+		let ephemeral_room_id = room_id.to_owned();
+		futures.push(
+			async move {
+				while let Ok(next) = ephemeral_rx.recv().await {
+					if next == ephemeral_room_id {
+						break;
+					}
+				}
+			}
+			.boxed(),
+		);
 	}
 
 	// Server shutdown

@@ -1621,6 +1621,20 @@ pub struct Config {
 	#[serde(default = "default_typing_client_timeout_max_s")]
 	pub typing_client_timeout_max_s: u64,
 
+	/// Allowlist of custom ephemeral event types accepted by the
+	/// Tuwunel-specific `PUT /_tuwunel/ephemeral/{event_type}/{room_id}`
+	/// endpoint. The endpoint stores the latest content per
+	/// `(room, event_type)` in memory and emits it into
+	/// `room.ephemeral.events` on the next `/sync`. A type must be
+	/// listed here to be accepted; unlisted types get a `403`.
+	///
+	/// Local-only — these events do not federate and are not
+	/// persisted to disk; restart clears state.
+	///
+	/// default: []
+	#[serde(default)]
+	pub allowed_ephemeral_types: Vec<String>,
+
 	/// Set this to true for tuwunel to compress HTTP response bodies using
 	/// zstd. This option does nothing if tuwunel was not built with
 	/// `zstd_compression` feature. Please be aware that enabling HTTP

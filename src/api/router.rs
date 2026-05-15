@@ -9,7 +9,7 @@ pub mod state;
 use axum::{
 	Router,
 	response::IntoResponse,
-	routing::{any, get, post},
+	routing::{any, get, post, put},
 };
 pub use client_ip::{ConfiguredIpSource, TrustedPeerSubnets};
 use http::{HeaderValue, header};
@@ -415,6 +415,10 @@ fn register_client_misc_routes(router: Router<State>) -> Router<State> {
 		.ruma_route(&client::well_known_client)
 		.ruma_route(&client::tuwunel_remote_version)
 		.route("/_tuwunel/server_version", get(client::tuwunel_server_version))
+		.route(
+			"/_tuwunel/ephemeral/{event_type}/{room_id}",
+			put(client::put_ephemeral_event_route),
+		)
 		.route(
 			"/_tuwunel/3pid/email/validate",
 			get(client::get_email_validate_route).post(client::post_email_validate_route),

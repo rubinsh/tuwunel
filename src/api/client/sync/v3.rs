@@ -123,6 +123,7 @@ struct BuildJoinedRoom {
 	receipt_events: Vec<(OwnedUserId, Raw<AnySyncEphemeralRoomEvent>)>,
 	typing_events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
 	private_read_events: Option<PrivateReadEvents>,
+	custom_ephemeral_events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
 	state_events: Vec<Raw<AnySyncStateEvent>>,
 	account_data_events: Vec<Raw<AnyRoomAccountDataEvent>>,
 	room_events: Vec<PduEvent>,
@@ -1365,6 +1366,7 @@ struct JoinAggregates {
 	account_data_events: Vec<Raw<AnyRoomAccountDataEvent>>,
 	typing_events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
 	private_read_events: Option<PrivateReadEvents>,
+	custom_ephemeral_events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
 	notification_count: Option<UInt>,
 	highlight_count: Option<UInt>,
 	thread_counts: Option<BTreeMap<OwnedEventId, (u64, u64)>>,
@@ -1400,6 +1402,17 @@ async fn await_join_aggregates(
 
 	let typing_events = gather_typing_events(services, room_id, sender_user, since);
 
+	let custom_ephemeral_events = async {
+		// Read and filter one snapshot. A separate last-update preflight could
+		// miss a PUT whose counter is already covered by this response's
+		// next_batch, causing the next /sync to skip that entry permanently.
+		// The upper bound defers newer PUTs instead of double-delivering them.
+		services
+			.ephemeral
+			.raw_events_for_sync(room_id, since, next_batch)
+			.await
+	};
+
 	let device_list_updates = gather_device_list_updates(
 		services,
 		sender_user,
@@ -1424,12 +1437,12 @@ async fn await_join_aggregates(
 
 	let (
 		(room_events, account_data_events),
-		(typing_events, private_read_events),
+		(typing_events, private_read_events, custom_ephemeral_events),
 		(notification_count, highlight_count, thread_counts),
 		(device_list_updates, left_encrypted_users),
 	) = join4(
 		join(room_events, account_data_events),
-		join(typing_events, private_read_events),
+		join3(typing_events, private_read_events, custom_ephemeral_events),
 		join3(notification_count, highlight_count, thread_counts),
 		device_list_updates,
 	)
@@ -1441,6 +1454,7 @@ async fn await_join_aggregates(
 		account_data_events,
 		typing_events,
 		private_read_events,
+		custom_ephemeral_events,
 		notification_count,
 		highlight_count,
 		thread_counts,
@@ -1480,6 +1494,7 @@ async fn finalize_joined_room(
 		account_data_events,
 		typing_events,
 		private_read_events,
+		custom_ephemeral_events,
 		notification_count,
 		highlight_count,
 		thread_counts,
@@ -1524,6 +1539,7 @@ async fn finalize_joined_room(
 			receipt_events,
 			typing_events,
 			private_read_events,
+			custom_ephemeral_events,
 			state_events,
 			account_data_events,
 			room_events,
@@ -1548,6 +1564,7 @@ fn build_joined_room(args: BuildJoinedRoom, event_fields: Option<&[String]>) -> 
 		receipt_events,
 		typing_events,
 		private_read_events,
+		custom_ephemeral_events,
 		state_events,
 		account_data_events,
 		room_events,
@@ -1567,6 +1584,7 @@ fn build_joined_room(args: BuildJoinedRoom, event_fields: Option<&[String]>) -> 
 		.map(at!(1))
 		.chain(typing_events)
 		.chain(private_read_events.into_iter().flatten())
+		.chain(custom_ephemeral_events)
 		.collect();
 
 	let state = state_after.wrap(StateEvents { events: state_events });

@@ -56,7 +56,9 @@ August 18, 2026
 
 - A one-time migration repairs two kinds of latent database damage on the first 1.9.0 boot. Releases before 1.8.3 could assign two short ids to one identity, leaving state entries that later removal could not cancel. Every release through 1.8.3 also cached auth chains truncated when an ancestor was missing, a normal backfill gap. Those chains are cleared once, and incomplete walks are now marked. A narrower cross-room case is a genuine regression first shipped in 1.5.0 (944f16520).
 
-- Expect a longer first boot before the listener opens while a clean database performs four full column scans once. The duration is unknown; this was found internally and not reported by a user.
+- Expect a longer first boot before the listener opens while a clean database performs four full column scans once. The duration is unknown; this was found internally and not reported by a user. Plan the upgrade as downtime and allow for sustained database I/O rather than treating a closed listener as a failed start.
+
+- **Take and verify a restorable database backup before the first 1.9.0 boot.** Startup migrations clear derived auth-chain data, may repair stored rows, and write completion markers. Once 1.9.0 has opened the database, replacing only the binary with an older release is not a supported rollback. To roll back, stop 1.9.0 and restore the complete pre-upgrade database backup before starting the previous binary.
 
 - A federation disclosure is fixed. `/state`, `/state_ids` and `/event_auth` looked up an event by id alone, allowing a server that held any event id from a room it had never been in, and could pass the access check on any other room here, to read the first room's state through the second room's URL. Tuwunel now validates the stored event's room, and wrong-room responses are byte-identical to missing-event responses. The issue dates to the server ACL implementation in early 2022.
 

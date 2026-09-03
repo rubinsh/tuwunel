@@ -7,8 +7,6 @@ use crate::Ruma;
 /// # `POST /_matrix/client/r0/pushers/set`
 ///
 /// Adds a pusher for the sender user.
-///
-/// - TODO: Handle `append`
 pub(crate) async fn set_pushers_route(
 	State(services): State<crate::State>,
 	body: Ruma<set_pusher::v3::Request>,

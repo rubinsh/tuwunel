@@ -1,12 +1,28 @@
 #![cfg(test)]
 
-use ruma::{EventId, RoomId, UserId};
+use std::{
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
+	time::Duration,
+};
+
+use ruma::{
+	EventId, RoomId, UserId,
+	api::client::push::{
+		EmailPusherData, Pusher, PusherIds, PusherKind,
+		set_pusher::v3::{PusherAction, PusherPostData},
+	},
+};
 use serde_json::{from_value, json};
+use tokio::{sync::Barrier, time::sleep};
+use tuwunel_core::utils::MutexMap;
 use tuwunel_database::{
 	Ignore, IgnoreAll, Interfix, SEP, deserialize_from_slice, serialize_to_vec,
 };
 
-use super::ExtractRelatesTo;
+use super::{ExtractRelatesTo, registration_key, should_remove_for_append};
 
 const ROOM: &str = "!room:example.com";
 const USER: &str = "@user:example.com";
@@ -17,6 +33,20 @@ fn room() -> &'static RoomId { ROOM.try_into().unwrap() }
 fn user() -> &'static UserId { USER.try_into().unwrap() }
 fn root_a() -> &'static EventId { THREAD_ROOT_A.try_into().unwrap() }
 fn root_b() -> &'static EventId { THREAD_ROOT_B.try_into().unwrap() }
+
+fn post_action(pushkey: &str, app_id: &str) -> PusherAction {
+	PusherAction::Post(PusherPostData {
+		pusher: Pusher {
+			ids: PusherIds::new(pushkey.to_owned(), app_id.to_owned()),
+			kind: PusherKind::Email(EmailPusherData::new()),
+			app_display_name: "Test App".into(),
+			device_display_name: "Test Device".into(),
+			profile_tag: None,
+			lang: "en".into(),
+		},
+		append: false,
+	})
+}
 
 fn main_key() -> Vec<u8> { serialize_to_vec((user(), room())).expect("serialize main key") }
 fn thread_key(root: &EventId) -> Vec<u8> {
@@ -75,6 +105,93 @@ fn notification_key_room_survives_main_and_thread_tail() {
 
 		assert_eq!(room_id, room());
 	}
+}
+
+#[test]
+fn append_false_replaces_only_cross_user_matching_app_and_pushkey() {
+	let sender: &UserId = "@new:example.com".try_into().unwrap();
+	let other: &UserId = "@old:example.com".try_into().unwrap();
+	let matching = post_action("shared-token", "com.example.app");
+
+	assert!(should_remove_for_append(
+		false,
+		sender,
+		other,
+		"com.example.app",
+		"shared-token",
+		"shared-token",
+		&matching,
+	));
+	assert!(!should_remove_for_append(
+		true,
+		sender,
+		other,
+		"com.example.app",
+		"shared-token",
+		"shared-token",
+		&matching,
+	));
+	assert!(!should_remove_for_append(
+		false,
+		sender,
+		sender,
+		"com.example.app",
+		"shared-token",
+		"shared-token",
+		&matching,
+	));
+	assert!(!should_remove_for_append(
+		false,
+		sender,
+		other,
+		"other.app",
+		"shared-token",
+		"shared-token",
+		&matching,
+	));
+	assert!(!should_remove_for_append(
+		false,
+		sender,
+		other,
+		"com.example.app",
+		"other-token",
+		"shared-token",
+		&matching,
+	));
+}
+
+#[tokio::test]
+async fn matching_registration_claims_are_serialized() {
+	let locks = Arc::new(MutexMap::<(String, String), ()>::new());
+	let barrier = Arc::new(Barrier::new(3));
+	let active = Arc::new(AtomicUsize::new(0));
+	let max_active = Arc::new(AtomicUsize::new(0));
+	let mut workers = Vec::new();
+
+	for _ in 0..2 {
+		let locks = locks.clone();
+		let barrier = barrier.clone();
+		let active = active.clone();
+		let max_active = max_active.clone();
+		workers.push(tokio::spawn(async move {
+			barrier.wait().await;
+			let key = registration_key("com.example.app", "shared-token");
+			let _guard = locks.lock(&key).await;
+			let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+			max_active.fetch_max(current, Ordering::SeqCst);
+			sleep(Duration::from_millis(20)).await;
+			active.fetch_sub(1, Ordering::SeqCst);
+		}));
+	}
+
+	barrier.wait().await;
+	for worker in workers {
+		worker
+			.await
+			.expect("registration worker completes");
+	}
+
+	assert_eq!(max_active.load(Ordering::SeqCst), 1);
 }
 
 /// A reaction relates to the event it annotates, which is the relation

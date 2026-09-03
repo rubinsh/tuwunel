@@ -63,6 +63,30 @@ const IN_REPLY_TO: &str = "m.in_reply_to";
 /// while MSC3664 evaluation is disabled.
 static NO_RELATED_EVENTS: LazyLock<Arc<RelatedEvents>> = LazyLock::new(Arc::default);
 
+fn registration_key(app_id: &str, pushkey: &str) -> (String, String) {
+	(app_id.to_owned(), pushkey.to_owned())
+}
+
+fn should_remove_for_append(
+	append: bool,
+	sender: &UserId,
+	owner: &UserId,
+	app_id: &str,
+	pushkey: &str,
+	stored_pushkey: &str,
+	action: &PusherAction,
+) -> bool {
+	let PusherAction::Post(data) = action else {
+		return false;
+	};
+
+	!append
+		&& owner != sender
+		&& stored_pushkey == pushkey
+		&& data.pusher.ids.app_id.as_str() == app_id
+		&& data.pusher.ids.pushkey.as_str() == pushkey
+}
+
 #[derive(Deserialize)]
 struct ExtractRelatesTo {
 	#[serde(rename = "m.relates_to")]
@@ -88,6 +112,7 @@ pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	notification_increment_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
 	highlight_increment_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
+	registration_mutex: MutexMap<(String, String), ()>,
 	db: Data,
 	suppressed: suppressed::SuppressedQueue,
 	sent_badges: SentBadges,
@@ -109,6 +134,7 @@ impl crate::Service for Service {
 			services: args.services.clone(),
 			notification_increment_mutex: MutexMap::new(),
 			highlight_increment_mutex: MutexMap::new(),
+			registration_mutex: MutexMap::new(),
 			db: Data {
 				db: args.db.clone(),
 				senderkey_pusher: args.db["senderkey_pusher"].clone(),
@@ -139,7 +165,8 @@ pub async fn set_pusher(
 			self.set_pusher_delete(sender, ids.pushkey.as_str())
 				.await,
 		| PusherAction::Post(data) =>
-			self.set_pusher_post(sender, sender_device, pusher, &data.pusher)?,
+			self.set_pusher_post(sender, sender_device, pusher, &data.pusher, data.append)
+				.await?,
 	}
 
 	Ok(())
@@ -151,12 +178,13 @@ async fn set_pusher_delete(&self, sender: &UserId, pushkey: &str) {
 }
 
 #[implement(Service)]
-fn set_pusher_post(
+async fn set_pusher_post(
 	&self,
 	sender: &UserId,
 	sender_device: &DeviceId,
 	action: &PusherAction,
 	pusher: &Pusher,
+	append: bool,
 ) -> Result {
 	let pushkey = pusher.ids.pushkey.as_str();
 
@@ -177,15 +205,65 @@ fn set_pusher_post(
 		self.check_http_pusher_url(&url)?;
 	}
 
-	let key = (sender, pushkey);
-	self.db.senderkey_pusher.put(key, Json(action));
-	self.db
-		.pushkey_deviceid
-		.insert(pushkey, sender_device);
+	let app_id = pusher.ids.app_id.as_str();
+	let registration_key = registration_key(app_id, pushkey);
+	let _registration_lock = self
+		.registration_mutex
+		.lock(&registration_key)
+		.await;
 
+	let replaced_owners = self
+		.conflicting_pusher_owners(sender, app_id, pushkey, append)
+		.await;
+
+	let mut txn = self.services.db.txn();
+	for owner in &replaced_owners {
+		txn.del(&self.db.senderkey_pusher, (&**owner, pushkey));
+	}
+	txn.put(&self.db.senderkey_pusher, (sender, pushkey), Json(action));
+	txn.insert_raw(&self.db.pushkey_deviceid, pushkey, sender_device);
+	txn.execute();
+
+	for owner in replaced_owners {
+		self.clear_suppressed_pushkey(&owner, pushkey);
+		self.forget_sent_badge(&owner, pushkey);
+		self.services
+			.sending
+			.cleanup_events(None, Some(&owner), Some(pushkey))
+			.await
+			.ok();
+	}
 	self.forget_sent_badge(sender, pushkey);
 
 	Ok(())
+}
+
+#[implement(Service)]
+async fn conflicting_pusher_owners(
+	&self,
+	sender: &UserId,
+	app_id: &str,
+	pushkey: &str,
+	append: bool,
+) -> Vec<OwnedUserId> {
+	self.db
+		.senderkey_pusher
+		.stream()
+		.ignore_err()
+		.ready_filter_map(|((owner, stored_pushkey), action): ((&UserId, &str), PusherAction)| {
+			should_remove_for_append(
+				append,
+				sender,
+				owner,
+				app_id,
+				pushkey,
+				stored_pushkey,
+				&action,
+			)
+			.then(|| owner.to_owned())
+		})
+		.collect()
+		.await
 }
 
 #[implement(Service)]

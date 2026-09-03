@@ -607,6 +607,7 @@ async fn run_cases(services: &Services) -> Result {
 	};
 
 	reject_bad_url(&fixture).await?;
+	append_semantics(&fixture).await?;
 	full_format_delivery(&fixture).await?;
 	event_id_only_delivery(&fixture).await?;
 	gateway_url_paths(&fixture).await?;
@@ -655,6 +656,115 @@ fn persist_message_pdu(
 		.raw_put(pdu_id, Json(&pdu));
 
 	Ok(pdu_id)
+}
+
+/// `append: false` transfers a matching app-id/pushkey claim between users,
+/// while `append: true` preserves both. Concurrent false claims serialize so
+/// exactly one user owns the registration when both requests complete.
+async fn append_semantics(fixture: &Fixture<'_>) -> Result {
+	let server_name = fixture.services.globals.server_name();
+	let old_user = UserId::parse_with_server_name("push-old", server_name)?;
+	let new_user = UserId::parse_with_server_name("push-new", server_name)?;
+	let race_a = UserId::parse_with_server_name("push-race-a", server_name)?;
+	let race_b = UserId::parse_with_server_name("push-race-b", server_name)?;
+	for user in [&old_user, &new_user, &race_a, &race_b] {
+		fixture
+			.services
+			.users
+			.create(user, Some("password"), None)
+			.await?;
+	}
+
+	let url = "http://127.0.0.1:9/_matrix/push/v1/notify".to_owned();
+	let transfer_key = "pk-append-transfer";
+	let transfer = pusher_action(transfer_key, url.clone(), false, false);
+	fixture
+		.services
+		.pusher
+		.set_pusher(&old_user, fixture.device, &transfer)
+		.await?;
+	fixture
+		.services
+		.pusher
+		.set_pusher(&new_user, fixture.device, &transfer)
+		.await?;
+
+	if fixture
+		.services
+		.pusher
+		.get_pusher(&old_user, transfer_key)
+		.await
+		.is_ok()
+	{
+		return Err!("append false left the prior user's matching pusher in place");
+	}
+	fixture
+		.services
+		.pusher
+		.get_pusher(&new_user, transfer_key)
+		.await
+		.map_err(|_| err!("append false did not store the new user's pusher"))?;
+
+	let preserve_key = "pk-append-preserve";
+	let mut preserve = pusher_action(preserve_key, url.clone(), false, false);
+	let PusherAction::Post(data) = &mut preserve else {
+		return Err!("pusher fixture unexpectedly produced a delete action");
+	};
+	data.append = true;
+	fixture
+		.services
+		.pusher
+		.set_pusher(&old_user, fixture.device, &preserve)
+		.await?;
+	fixture
+		.services
+		.pusher
+		.set_pusher(&new_user, fixture.device, &preserve)
+		.await?;
+	fixture
+		.services
+		.pusher
+		.get_pusher(&old_user, preserve_key)
+		.await?;
+	fixture
+		.services
+		.pusher
+		.get_pusher(&new_user, preserve_key)
+		.await?;
+
+	let race_key = "pk-append-race";
+	let race_action_a = pusher_action(race_key, url.clone(), false, false);
+	let race_action_b = race_action_a.clone();
+	let (result_a, result_b) = tokio::join!(
+		fixture
+			.services
+			.pusher
+			.set_pusher(&race_a, fixture.device, &race_action_a),
+		fixture
+			.services
+			.pusher
+			.set_pusher(&race_b, fixture.device, &race_action_b),
+	);
+	result_a?;
+	result_b?;
+
+	let owner_a = fixture
+		.services
+		.pusher
+		.get_pusher(&race_a, race_key)
+		.await
+		.is_ok();
+	let owner_b = fixture
+		.services
+		.pusher
+		.get_pusher(&race_b, race_key)
+		.await
+		.is_ok();
+	if owner_a == owner_b {
+		return Err!("concurrent append false registrations did not leave exactly one owner");
+	}
+
+	Ok(())
 }
 
 /// A pusher URL that is neither http nor https is rejected at creation.

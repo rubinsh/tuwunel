@@ -219,6 +219,13 @@ async fn remote_room_summary_hierarchy_response(
 		)));
 	}
 
+	if servers.is_empty() {
+		return Err!(Request(NotFound(
+			"Room is unknown to this server and no servers were provided to fetch it over \
+			 federation."
+		)));
+	}
+
 	let request = get_hierarchy::v1::Request::new(room_id.to_owned());
 
 	let mut requests: FuturesUnordered<_> = servers
@@ -230,9 +237,17 @@ async fn remote_room_summary_hierarchy_response(
 		})
 		.collect();
 
-	while let Some(Ok(response)) = requests.next().await {
+	while let Some(result) = requests.next().await {
+		let response = match result {
+			| Ok(response) => response,
+			| Err(e) => {
+				debug_warn!(?e, "Failed to fetch room hierarchy over federation");
+				continue;
+			},
+		};
+
 		trace!("{response:?}");
-		let room = response.room.clone();
+		let room = response.room;
 		let summary = &room.summary;
 		if summary.room_id != room_id {
 			debug_warn!(

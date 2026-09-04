@@ -26,7 +26,7 @@ use super::{
 	},
 };
 
-/// Check whether the given event passes the `m.room.roomber` authorization
+/// Check whether the given event passes the `m.room.member` authorization
 /// rules.
 ///
 /// This assumes that `ruma_signatures::verify_event()` was called previously,

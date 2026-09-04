@@ -77,6 +77,26 @@ on:
         type: boolean
         default: false
         description: Enable publication stage
+      enable_test_complement_interop:
+        type: boolean
+        default: false
+        description: "Interop: run Complement against a foreign homeserver"
+      enable_test_complement_interop_inverse:
+        type: boolean
+        default: false
+        description: "Interop: run Complement with the foreign homeserver as hs1"
+      complement_interop_run:
+        type: string
+        default: '.*'
+        description: "Interop: test selector regex"
+      playwright_shards:
+        type: string
+        default: '1'
+        description: "Playwright: number of test shards"
+      playwright_workers:
+        type: string
+        default: '1'
+        description: "Playwright: workers per shard"
 
 concurrency:
   group: ${{github.workflow}}-${{github.ref}}
@@ -97,6 +117,8 @@ jobs:
       default_machines: '["X64"]'
       default_package_containers: '["docker", "oci"]'
       default_package_distros: '["deb", "rpm", "nix"]'
+      default_playwright_shards: '8'
+      default_playwright_workers: '1'
       is_release: ${{contains(github.ref, 'tags/v')}}
       is_branch: ${{contains(github.ref, 'refs/heads')}}
       is_pull: ${{contains(github.ref, 'refs/pull')}}
@@ -122,22 +144,34 @@ jobs:
       enable_test_doc: ${{fromJSON(inputs.enable_test_doc || 'true')}}
       enable_test_unit: ${{fromJSON(inputs.enable_test_unit || 'true')}}
       enable_test_bench: ${{fromJSON(inputs.enable_test_bench || 'true')}}
-      enable_test_memcheck: ${{fromJSON(inputs.enable_test_memcheck || 'true')}}
+      enable_test_memcheck: ${{fromJSON(inputs.enable_test_memcheck || env.is_test)}}
       enable_test_smoke: ${{fromJSON(inputs.enable_test_smoke || env.is_fat || 'false')}}
       enable_test_nix: ${{fromJSON(inputs.enable_test_nix || 'true')}}
       enable_test_rustsdk: ${{fromJSON(inputs.enable_test_rustsdk || 'true')}}
       enable_test_complement: ${{fromJSON(inputs.enable_test_complement || 'true')}}
+      enable_test_complement_debug: ${{fromJSON(inputs.enable_test_complement_debug || 'true')}}
       complement_verbose: ${{fromJSON(inputs.complement_verbose || 'false')}}
       complement_runner: 'het'
+      enable_test_complement_crypto: ${{fromJSON(inputs.enable_test_complement_crypto || 'true')}}
+      complement_crypto_verbose: ${{fromJSON(inputs.complement_crypto_verbose || 'false')}}
+      enable_test_complement_interop: ${{fromJSON(inputs.enable_test_complement_interop || 'true')}}
+      enable_test_complement_interop_inverse: ${{fromJSON(inputs.enable_test_complement_interop_inverse || 'true')}}
+      complement_interop_run: ${{inputs.complement_interop_run || '.*'}}
+      enable_test_mas: ${{fromJSON(inputs.enable_test_mas || 'true')}}
+      mas_verbose: ${{fromJSON(inputs.mas_verbose || 'false')}}
+      enable_test_playwright: ${{fromJSON(inputs.enable_test_playwright || env.is_branch || 'false')}}
+      playwright_runner: 'het'
+      playwright_shards: ${{inputs.playwright_shards || vars.PLAYWRIGHT_SHARDS || env.default_playwright_shards}}
+      playwright_workers: ${{inputs.playwright_workers || vars.PLAYWRIGHT_WORKERS || env.default_playwright_workers}}
       enable_package: ${{fromJSON(inputs.enable_package || 'true')}}
       enable_package_book: ${{fromJSON(inputs.enable_package_book || 'true')}}
       enable_package_docs: ${{fromJSON(inputs.enable_package_docs || 'true')}}
-      enable_package_binary: ${{fromJSON(inputs.enable_package_binary || 'true')}}
+      enable_package_binary: ${{fromJSON(inputs.enable_package_binary || env.is_fat || env.is_pull || 'false')}}
       enable_package_container: ${{fromJSON(inputs.enable_package_container || env.is_fat || 'true')}}
       package_containers: ${{inputs.package_containers || env.default_package_containers}}
       enable_package_distro: ${{fromJSON(inputs.enable_package_distro || env.is_fat || 'false')}}
       package_distros: ${{inputs.package_distros || env.default_package_distros}}
-      enable_package_checks: ${{fromJSON(inputs.enable_package_checks || env.is_test || 'false')}}
+      enable_package_checks: ${{fromJSON(inputs.enable_package_checks || env.is_fat || 'false')}}
       enable_publish: ${{fromJSON(inputs.enable_publish || 'true')}}
       is_release: ${{fromJSON(env.is_release || 'false')}}
       is_main: ${{fromJSON(env.is_main || 'false')}}
@@ -149,6 +183,8 @@ jobs:
       release_url: ${{steps.release.outputs.upload_url}}
       docker_repo: ${{vars.DOCKER_REPO}}
       docker_acct: ${{vars.DOCKER_ACCT}}
+      apt_ssh_dest: ${{vars.APT_SSH_DEST}}
+      apt_ssh_hostkey: ${{vars.APT_SSH_HOSTKEY}}
 
     strategy:
       fail-fast: true
@@ -158,104 +194,25 @@ jobs:
         exclude: ${{fromJSON(vars.RUNNERS_EXCLUDES || '[]')}}
 
     steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{inputs.checkout || github.sha}}
+
     - name: Initialize Builder
       env:
         runner: ${{matrix.runner}}
-        reserved_space:      '{"het": "192GB", "aws": "48GB"}'
-        max_used_space:      '{"het": "384GB", "aws": "64GB"}'
-        min_free_space:      '{"het": "32GB",  "aws": "16GB"}'
-        safety_free_space:   '{"het": "8GB",   "aws": "4GB"}'
-        trunk_max_used:      '{"het": "48GB",  "aws": "12GB"}'
-        branch_max_used:     '{"het": "144GB", "aws": "16GB"}'
-        unlabeled_max_used:  '{"het": "16GB",  "aws": "4GB"}'
-        leaf_max_used:       '{"het": "128GB", "aws": "20GB"}'
-        cachemount_max_used: '{"het": "32GB",  "aws": "8GB"}'
+        pipeline: ${{inputs.pipeline || github.event.head_commit.message || github.event.workflow_run.head_commit.message}}
+        seed_builder: ${{vars.SEED_BUILDER || 'jevolk'}}
+        reserved_space:    '{"het": "40GB",  "aws": "12GB"}'
+        max_used_space:    '{"het": "120GB", "aws": "32GB"}'
+        cachemount_max:    '{"het": "80GB",  "aws": "12GB"}'
+        min_free_space:    '{"het": "32GB",  "aws": "16GB"}'
+        safety_free_space: '{"het": "16GB",  "aws": "8GB"}'
+        reap_idle_hours:   '{"het": "24",    "aws": "24"}'
+        reap_min_free:     '{"het": "500GB", "aws": "40GB"}'
+        seed_budget:       '{"het": "250GB", "aws": "0GB"}'
       run: |
-        set +e
-        docker buildx inspect "${GITHUB_ACTOR}"
-        if test x"$?" = x"0"; then
-          exit 0
-        fi
-
-        set -eux
-        reserved_space=$(echo -n "$reserved_space" | jq -r ".$runner")
-        max_used_space=$(echo -n "$max_used_space" | jq -r ".$runner")
-        min_free_space=$(echo -n "$min_free_space" | jq -r ".$runner")
-        safety_free_space=$(echo -n "$safety_free_space" | jq -r ".$runner")
-        trunk_max_used=$(echo -n "$trunk_max_used" | jq -r ".$runner")
-        branch_max_used=$(echo -n "$branch_max_used" | jq -r ".$runner")
-        unlabeled_max_used=$(echo -n "$unlabeled_max_used" | jq -r ".$runner")
-        leaf_max_used=$(echo -n "$leaf_max_used" | jq -r ".$runner")
-        cachemount_max_used=$(echo -n "$cachemount_max_used" | jq -r ".$runner")
-        cat <<EOF > ./buildkitd.toml
-        [system]
-          platformsCacheMaxAge = "504h"
-        [worker.oci]
-          enabled = true
-          rootless = false
-          gc = true
-          reservedSpace = "${reserved_space}"
-          maxUsedSpace = "${max_used_space}"
-          minFreeSpace = "${min_free_space}"
-
-        # Leaf: per-run outputs (build-bins, build-tests, install, complement,
-        # integ, smoke, packaging) plus the final image targets (static,
-        # docker, oci, complement-testee) we want to reuse across runs.
-        # Sized to hold ~1-2 full default-matrix runs of leaf images.
-        [[worker.oci.gcpolicy]]
-          filters = ["label==cache.tier==leaf"]
-          keepDuration = "1h"
-          maxUsedSpace = "${leaf_max_used}"
-          all = true
-
-        # Cache mounts: cargo registry, cargo git, rustup downloads. Slow-
-        # changing, expensive to refetch; given their own bucket so the
-        # leaf-tier churn doesn't evict them.
-        [[worker.oci.gcpolicy]]
-          filters = ["type==cachemount"]
-          keepDuration = "168h"
-          maxUsedSpace = "${cachemount_max_used}"
-          all = true
-
-        # Unlabeled records: intermediate exec layers, frontend bookkeeping,
-        # anything not explicitly tiered. Excludes cachemount via type filter
-        # so the cachemount bucket above is the sole evictor for those.
-        [[worker.oci.gcpolicy]]
-          filters = ["label!=cache.tier==leaf,label!=cache.tier==branch,label!=cache.tier==trunk,type!=cachemount"]
-          keepDuration = "24h"
-          maxUsedSpace = "${unlabeled_max_used}"
-          all = true
-
-        # Branch: cooked deps (deps-base), rocksdb compile, cargo. Expensive
-        # cargo_rust_feat_sys nodes. Day-scale age protection; size cap is
-        # the dominant trigger so small runners can churn this tier normally.
-        [[worker.oci.gcpolicy]]
-          filters = ["label==cache.tier==branch"]
-          keepDuration = "24h"
-          maxUsedSpace = "${branch_max_used}"
-          all = true
-
-        # Trunk: foundation layers (system, rust). Week-scale age protection
-        # so trunk survives any normal pressure; size cap is the backstop.
-        [[worker.oci.gcpolicy]]
-          filters = ["label==cache.tier==trunk"]
-          keepDuration = "168h"
-          maxUsedSpace = "${trunk_max_used}"
-          all = true
-
-        # Safety floor: under critical disk pressure, evict anything regardless
-        # of tier or age. Only relief valve when tier caps haven't sufficed.
-        [[worker.oci.gcpolicy]]
-          minFreeSpace = "${safety_free_space}"
-          all = true
-        EOF
-
-        docker buildx create \
-          --bootstrap \
-          --driver docker-container \
-          --buildkitd-config ./buildkitd.toml \
-          --name "${GITHUB_ACTOR}" \
-          --buildkitd-flags "--allow-insecure-entitlement network.host"
+        .github/workflows/init.sh
 
     - if: >
         !failure() && !cancelled()
@@ -348,8 +305,20 @@ jobs:
       enable_nix: ${{needs.init.outputs.enable_test_nix}}
       enable_rustsdk: ${{needs.init.outputs.enable_test_rustsdk}}
       enable_complement: ${{needs.init.outputs.enable_test_complement}}
+      enable_complement_debug: ${{needs.init.outputs.enable_test_complement_debug}}
       complement_runner: ${{needs.init.outputs.complement_runner}}
       complement_verbose: ${{needs.init.outputs.complement_verbose}}
+      enable_complement_crypto: ${{needs.init.outputs.enable_test_complement_crypto}}
+      complement_crypto_verbose: ${{needs.init.outputs.complement_crypto_verbose}}
+      enable_complement_interop: ${{needs.init.outputs.enable_test_complement_interop}}
+      enable_complement_interop_inverse: ${{needs.init.outputs.enable_test_complement_interop_inverse}}
+      complement_interop_run: ${{needs.init.outputs.complement_interop_run}}
+      enable_mas: ${{needs.init.outputs.enable_test_mas}}
+      mas_verbose: ${{needs.init.outputs.mas_verbose}}
+      enable_playwright: ${{needs.init.outputs.enable_test_playwright}}
+      playwright_runner: ${{needs.init.outputs.playwright_runner}}
+      playwright_shards: ${{needs.init.outputs.playwright_shards}}
+      playwright_workers: ${{needs.init.outputs.playwright_workers}}
       cargo_profiles: ${{needs.init.outputs.cargo_profiles}}
       feat_sets: ${{needs.init.outputs.feat_sets}}
       rust_toolchains: ${{needs.init.outputs.rust_toolchains}}
@@ -473,6 +442,8 @@ jobs:
       checkout: ${{needs.init.outputs.checkout}}
       docker_repo: ${{needs.init.outputs.docker_repo}}
       docker_acct: ${{needs.init.outputs.docker_acct}}
+      apt_ssh_dest: ${{needs.init.outputs.apt_ssh_dest}}
+      apt_ssh_hostkey: ${{needs.init.outputs.apt_ssh_hostkey}}
       release_url: ${{needs.init.outputs.release_url}}
       pages_url: ${{needs.init.outputs.pages_url}}
       cargo_profiles: ${{needs.init.outputs.cargo_profiles}}
@@ -510,3 +481,15 @@ jobs:
     secrets:
       ghcr_token: ${{ secrets.GHCR_TOKEN }}
       dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+      apt_ssh_key: ${{ secrets.APT_DEPLOY_SSH_KEY }}
+
+#  stats:
+#    if: >
+#      !cancelled()
+#
+#    name: Stats
+#    needs: [init, lint, test, package, publish]
+#    uses: ./.github/workflows/stats.yml
+#    with:
+#      machines: ${{needs.init.outputs.machines}}
+#      checkout: ${{needs.init.outputs.checkout}}

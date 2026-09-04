@@ -1,5 +1,6 @@
 use std::{
-	collections::{BTreeMap, HashSet},
+	borrow::Cow,
+	collections::BTreeMap,
 	ffi::c_int,
 	fmt::Write as _,
 	fs,
@@ -8,10 +9,11 @@ use std::{
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{ToTokens, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::{
-	Error, Expr, ExprLit, Field, Fields, FieldsNamed, ItemStruct, Lit, Meta, MetaList,
-	MetaNameValue, Type, TypePath, parse::Parser, punctuated::Punctuated, spanned::Spanned,
+	Error, Expr, ExprLit, Field, Fields, FieldsNamed, ItemStruct, Lit, LitStr, Meta, MetaList,
+	MetaNameValue, Token, Type, TypePath, ext::IdentExt as _, parse::Parser,
+	punctuated::Punctuated, spanned::Spanned,
 };
 
 use crate::{
@@ -47,7 +49,6 @@ pub(super) fn example_generator(input: ItemStruct, args: &[Meta]) -> Result<Toke
 		.into())
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn generate_example(input: &ItemStruct, args: &[Meta], emit: bool) -> Result<TokenStream2> {
 	let settings = get_simple_settings(args);
 
@@ -63,92 +64,141 @@ fn generate_example(input: &ItemStruct, args: &[Meta], emit: bool) -> Result<Tok
 		.get("undocumented")
 		.map_or(UNDOCUMENTED, String::as_str);
 
-	let ignore: HashSet<&str> = settings
-		.get("ignore")
+	let ignore = settings.get("ignore").map_or("", String::as_str);
+	let hidden = settings.get("hidden").map_or("", String::as_str);
+	let forbidden = settings
+		.get("forbidden")
+		.map_or("", String::as_str);
+
+	let section_aliases = settings
+		.get("section_aliases")
 		.map_or("", String::as_str)
-		.split(' ')
-		.collect();
+		.split_ascii_whitespace();
+
+	let contains = |fields: &str, name: &str| {
+		fields
+			.split_ascii_whitespace()
+			.any(|field| field == name)
+	};
 
 	let truncate = section == "global";
 	let mut section_buf = String::new();
 
-	if emit {
-		if let Some(header) = settings.get("header") {
-			section_buf.push_str(header);
-		}
-
-		let pound = if section != "global" { "\n#" } else { "" };
-		write!(&mut section_buf, "\n\n{pound}[{section}]\n").expect("written to section buffer");
+	if let Some(header) = settings.get("header") {
+		section_buf.push_str(header);
 	}
 
-	let mut summary: Vec<TokenStream2> = Vec::new();
-	if let Fields::Named(FieldsNamed { named, .. }) = &input.fields {
-		for field in named {
-			let Some(ident) = &field.ident else {
-				continue;
-			};
+	let comment_prefix = if section != "global" { "\n#" } else { "" };
 
-			if ignore.contains(ident.to_string().as_str()) {
-				continue;
-			}
+	write!(&mut section_buf, "\n\n{comment_prefix}[{section}]\n")
+		.expect("written to section buffer");
 
-			if get_type_name(field).is_none() {
-				continue;
-			}
+	let (summary, fields) = if let Fields::Named(FieldsNamed { named, .. }) = &input.fields {
+		let capacity = named.len();
 
-			let doc = get_doc_comment(field)
-				.unwrap_or_else(|| undocumented.into())
-				.trim_end()
-				.to_owned();
+		named
+			.iter()
+			.filter(|field| get_type_name(field).is_some())
+			.filter_map(|field| field.ident.as_ref().map(|ident| (field, ident)))
+			.fold(
+				(Vec::with_capacity(capacity), Vec::with_capacity(capacity)),
+				|(mut summary, mut fields), (field, ident)| {
+					let name = ident.to_string();
+					let is_hidden = contains(hidden, name.as_str());
+					let (class, documented) = match () {
+						| () if contains(forbidden, name.as_str()) =>
+							(quote! { crate::config::regenerate::FieldClass::Forbidden }, false),
+						| () if is_hidden =>
+							(quote! { crate::config::regenerate::FieldClass::Hidden }, false),
+						| () if contains(ignore, name.as_str()) =>
+							(quote! { crate::config::regenerate::FieldClass::Structural }, false),
+						| () =>
+							(quote! { crate::config::regenerate::FieldClass::Documented }, true),
+					};
 
-			let doc = if doc.ends_with('#') {
-				format!("{doc}\n")
-			} else {
-				format!("{doc}\n#\n")
-			};
+					let example = example_value(field);
+					let aliases = get_serde_aliases(field);
+					let spec_example = is_hidden
+						.then_some(example.as_ref())
+						.unwrap_or_default();
 
-			// `config-example` overrides the emitted example value while `default`
-			// continues to document the runtime default separately.
-			let default = example_value(field);
+					let field_spec = quote! {
+						crate::config::regenerate::FieldSpec {
+							name: #name,
+							aliases: &[#(#aliases),*],
+							example: #spec_example,
+							class: #class,
+						}
+					};
 
-			let default = if !default.is_empty() {
-				format!(" {default}")
-			} else {
-				default
-			};
+					fields.push(field_spec);
 
-			if emit {
-				write!(&mut section_buf, "\n{doc}").expect("written to section buffer");
+					if !documented {
+						return (summary, fields);
+					}
 
-				writeln!(&mut section_buf, "#{ident} ={default}")
-					.expect("written to section buffer");
-			}
+					let doc = get_doc_comment(field)
+						.unwrap_or_else(|| undocumented.into())
+						.trim_end()
+						.to_owned();
 
-			let display = get_doc_comment_line(field, "display");
-			let display_directive = |key| {
-				display
-					.as_ref()
-					.into_iter()
-					.flat_map(|display| display.split(' '))
-					.any(|directive| directive == key)
-			};
+					// A `reloadable:` directive alone does not satisfy the documentation
+					// request; prepend the undocumented placeholder when prose is absent.
+					let doc = if doc.lines().all(|line| {
+						let body = line.trim_start_matches('#').trim();
+						body.is_empty() || body.starts_with("reloadable:")
+					}) {
+						format!("{undocumented}\n{doc}")
+					} else {
+						doc
+					};
 
-			if !display_directive("hidden") {
-				let value = if display_directive("sensitive") {
-					quote! { "***********" }
-				} else {
-					quote! { format_args!("{:?}", self.#ident) }
-				};
+					let doc = if doc.ends_with('#') {
+						format!("{doc}\n")
+					} else {
+						format!("{doc}\n#\n")
+					};
 
-				let name = ident.to_string();
-				summary.push(quote! {
-					writeln!(out, "| {} | {} |", #name, #value)?;
-				});
-			}
-		}
-	}
+					let example_separator = (!example.is_empty())
+						.then_some(" ")
+						.unwrap_or_default();
 
-	if emit && let Some(footer) = settings.get("footer") {
+					write!(&mut section_buf, "\n{doc}").expect("written to section buffer");
+
+					writeln!(&mut section_buf, "#{ident} ={example_separator}{example}")
+						.expect("written to section buffer");
+
+					let display = get_doc_comment_line(field, "display");
+					let display_directive = |key| {
+						display
+							.as_ref()
+							.into_iter()
+							.flat_map(|display| display.split(' '))
+							.any(|directive| directive == key)
+					};
+
+					if !display_directive("hidden") {
+						let value = if display_directive("sensitive") {
+							quote! { "***********" }
+						} else {
+							quote! { format_args!("{:?}", self.#ident) }
+						};
+
+						let display = quote! {
+							writeln!(out, "| {} | {} |", #name, #value)?;
+						};
+
+						summary.push(display);
+					}
+
+					(summary, fields)
+				},
+			)
+	} else {
+		(Vec::new(), Vec::new())
+	};
+
+	if let Some(footer) = settings.get("footer") {
 		section_buf.push_str(footer);
 	}
 
@@ -157,7 +207,12 @@ fn generate_example(input: &ItemStruct, args: &[Meta], emit: bool) -> Result<Tok
 	}
 
 	let struct_name = &input.ident;
+	let cfg_attrs = cfg_attrs(input)?;
+	let registration =
+		generate_registration(input, &cfg_attrs, section, section_aliases, &section_buf, &fields);
+
 	let display = quote! {
+		#(#cfg_attrs)*
 		impl std::fmt::Display for #struct_name {
 			fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 				writeln!(out, "| name | value |")?;
@@ -168,7 +223,114 @@ fn generate_example(input: &ItemStruct, args: &[Meta], emit: bool) -> Result<Tok
 		}
 	};
 
-	Ok(display)
+	let generated = quote! {
+		#registration
+		#display
+	};
+
+	Ok(generated)
+}
+
+fn cfg_attrs(input: &ItemStruct) -> Result<Vec<TokenStream2>> {
+	input
+		.attrs
+		.iter()
+		.try_fold(Vec::new(), |mut cfg_attrs, attribute| {
+			if attribute.path().is_ident("cfg") {
+				cfg_attrs.push(attribute.to_token_stream());
+
+				return Ok(cfg_attrs);
+			}
+
+			let Meta::List(MetaList { path, tokens, .. }) = &attribute.meta else {
+				return Ok(cfg_attrs);
+			};
+
+			if !path.is_ident("cfg_attr") {
+				return Ok(cfg_attrs);
+			}
+
+			let mut args = Punctuated::<Meta, Token![,]>::parse_terminated
+				.parse2(tokens.clone())?
+				.into_iter();
+
+			let Some(predicate) = args.next() else {
+				return Err(Error::new(attribute.span(), "cfg_attr requires a predicate"));
+			};
+
+			let mut nested = args
+				.filter(|meta| meta.path().is_ident("cfg"))
+				.peekable();
+
+			if nested.peek().is_some() {
+				cfg_attrs.push(quote! { #[cfg_attr(#predicate, #(#nested),*)] });
+			}
+
+			Ok(cfg_attrs)
+		})
+}
+
+fn generate_registration<'a, SectionAliases>(
+	input: &ItemStruct,
+	cfg_attrs: &[TokenStream2],
+	section: &str,
+	section_aliases: SectionAliases,
+	section_buf: &str,
+	fields: &[TokenStream2],
+) -> TokenStream2
+where
+	SectionAliases: Iterator<Item = &'a str>,
+{
+	let registration_name = format_ident!(
+		"TUWUNEL_CONFIG_SECTION_{}",
+		input.ident.unraw().to_string().to_uppercase(),
+	);
+
+	quote! {
+		#(#cfg_attrs)*
+		#[::link_section::in_section(crate::config::regenerate::REGISTERED_SECTIONS)]
+		const #registration_name: crate::config::regenerate::SectionSpec =
+			crate::config::regenerate::SectionSpec {
+				section: #section,
+				aliases: &[#(#section_aliases),*],
+				example: #section_buf,
+				fields: &[#(#fields),*],
+				position: crate::config::regenerate::SourcePosition {
+					file: file!(),
+					line: line!(),
+					column: column!(),
+				},
+			};
+	}
+}
+
+fn get_serde_aliases(field: &Field) -> impl Iterator<Item = LitStr> + '_ {
+	field
+		.attrs
+		.iter()
+		.filter(|attr| attr.path().is_ident("serde"))
+		.filter_map(|attr| {
+			let Meta::List(MetaList { tokens, .. }) = &attr.meta else {
+				return None;
+			};
+
+			Punctuated::<Meta, Token![,]>::parse_terminated
+				.parse2(tokens.clone())
+				.ok()
+		})
+		.flatten()
+		.filter_map(|arg| {
+			let Meta::NameValue(MetaNameValue {
+				path,
+				value: Expr::Lit(ExprLit { lit: Lit::Str(alias), .. }),
+				..
+			}) = arg
+			else {
+				return None;
+			};
+
+			path.is_ident("alias").then_some(alias)
+		})
 }
 
 fn append_section(filename: &str, truncate: bool, content: &[u8]) {
@@ -205,7 +367,7 @@ extern "C" fn flush_file_buffers() {
 	}
 }
 
-fn get_default(field: &Field) -> Option<String> {
+fn get_default(field: &Field) -> Option<Cow<'static, str>> {
 	for attr in &field.attrs {
 		let Meta::List(MetaList { path, tokens, .. }) = &attr.meta else {
 			continue;
@@ -220,8 +382,8 @@ fn get_default(field: &Field) -> Option<String> {
 			continue;
 		}
 
-		let Some(arg) = Punctuated::<Meta, syn::Token![,]>::parse_terminated
-			.parse(tokens.clone().into())
+		let Some(arg) = Punctuated::<Meta, Token![,]>::parse_terminated
+			.parse2(tokens.clone())
 			.ok()?
 			.into_iter()
 			.next()
@@ -230,17 +392,19 @@ fn get_default(field: &Field) -> Option<String> {
 		};
 
 		match arg {
+			| Meta::Path { .. } => return Some(Cow::Borrowed("false")),
 			| Meta::NameValue(MetaNameValue {
 				value: Expr::Lit(ExprLit { lit: Lit::Str(str), .. }),
 				..
 			}) => {
 				match str.value().as_str() {
-					| "HashSet::new" | "Vec::new" | "RegexSet::empty" => Some("[]".to_owned()),
-					| "true_fn" => return Some("true".to_owned()),
+					| "true_fn" => return Some(Cow::Borrowed("true")),
+					| "HashSet::new" | "Vec::new" | "RegexSet::empty" => {
+						return Some(Cow::Borrowed("[]"));
+					},
 					| _ => return None,
 				};
 			},
-			| Meta::Path { .. } => return Some("false".to_owned()),
 			| _ => return None,
 		}
 	}
@@ -248,9 +412,10 @@ fn get_default(field: &Field) -> Option<String> {
 	None
 }
 
-fn example_value(field: &Field) -> String {
+fn example_value(field: &Field) -> Cow<'static, str> {
 	get_doc_comment_line(field, "config-example")
-		.or_else(|| get_doc_comment_line(field, "default"))
+		.map(Cow::Owned)
+		.or_else(|| get_doc_comment_line(field, "default").map(Cow::Owned))
 		.or_else(|| get_default(field))
 		.unwrap_or_default()
 }
@@ -265,7 +430,12 @@ fn get_doc_comment(field: &Field) -> Option<String> {
 				line.trim().starts_with(key) && line.trim().chars().nth(key.len()) == Some(':')
 			})
 		})
-		.fold(String::new(), |full, line| full + "#" + line + "\n");
+		.fold(String::new(), |mut full, line| {
+			full.push('#');
+			full.push_str(line);
+			full.push('\n');
+			full
+		});
 
 	(!out.is_empty()).then_some(out)
 }
@@ -332,13 +502,52 @@ fn get_type_name(field: &Field) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-	use syn::parse_quote;
+	use syn::{Field, parse_quote};
 
-	use super::{example_value, get_doc_comment};
+	use super::{example_value, get_default, get_doc_comment, get_serde_aliases};
+
+	#[test]
+	fn empty_collection_defaults_render_as_arrays() {
+		let hash_set: Field = parse_quote! {
+			#[serde(default = "HashSet::new")]
+			value: ()
+		};
+
+		let vec: Field = parse_quote! {
+			#[serde(default = "Vec::new")]
+			value: ()
+		};
+
+		let regex_set: Field = parse_quote! {
+			#[serde(default = "RegexSet::empty")]
+			value: ()
+		};
+
+		let fields: [(&str, Field); 3] =
+			[("HashSet::new", hash_set), ("Vec::new", vec), ("RegexSet::empty", regex_set)];
+
+		for (name, field) in &fields {
+			assert_eq!(get_default(field).as_deref(), Some("[]"), "{name}");
+		}
+	}
+
+	#[test]
+	fn serde_aliases_are_collected_in_declaration_order() {
+		let field: Field = parse_quote! {
+			#[serde(default, alias = "old_name", alias = "older_name")]
+			value: String
+		};
+
+		assert!(
+			get_serde_aliases(&field)
+				.map(|alias| alias.value())
+				.eq(["old_name", "older_name"])
+		);
+	}
 
 	#[test]
 	fn config_example_overrides_default_for_generated_example_value() {
-		let field: syn::Field = parse_quote! {
+		let field: Field = parse_quote! {
 			#[doc = "config-example: from example"]
 			#[doc = "default: from default"]
 			name: String
@@ -349,7 +558,7 @@ mod tests {
 
 	#[test]
 	fn config_example_is_hidden_from_emitted_comments() {
-		let field: syn::Field = parse_quote! {
+		let field: Field = parse_quote! {
 			#[doc = "visible setting docs"]
 			#[doc = "config-example: hidden value"]
 			name: String

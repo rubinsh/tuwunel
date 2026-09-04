@@ -1,10 +1,62 @@
-mod commands;
+mod add_email;
+mod create_user;
+mod deactivate;
+mod deactivate_all;
+mod del_email;
+mod delete_device;
+mod delete_room_tag;
+mod erasure;
+mod force_demote;
+mod force_join_all_local_users;
+mod force_join_list_of_local_users;
+mod force_join_room;
+mod force_leave_room;
+mod force_promote;
+mod get_room_tags;
+mod last_active;
+mod list_joined_rooms;
+mod list_users;
+mod make_user_admin;
+mod put_room_tag;
+mod redact_event;
+mod reject_invites;
+mod reset_password;
+mod set_profile_key;
+mod unerase;
 
-use clap::Subcommand;
-use ruma::{OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId};
+use clap::{ArgGroup, Subcommand, ValueEnum};
+use futures::FutureExt;
+use ruma::{OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId, UserId};
 use tuwunel_core::Result;
+use tuwunel_service::{Services, profile::Propagation};
 
 use crate::admin_command_dispatch;
+
+const AUTO_GEN_PASSWORD_LENGTH: usize = 25;
+const BULK_JOIN_REASON: &str = "Bulk force joining this room as initiated by the server admin.";
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(super) enum PropagateTo {
+	/// Send a member event to every joined room.
+	All,
+
+	/// Send a member event only to rooms whose current per-room value matches
+	/// the user's prior global value.
+	Unchanged,
+
+	/// Send no member events; update the global profile only.
+	None,
+}
+
+impl From<PropagateTo> for Propagation {
+	fn from(propagate_to: PropagateTo) -> Self {
+		match propagate_to {
+			| PropagateTo::All => Self::All,
+			| PropagateTo::Unchanged => Self::Unchanged,
+			| PropagateTo::None => Self::None,
+		}
+	}
+}
 
 #[admin_command_dispatch]
 #[derive(Debug, Subcommand)]
@@ -24,6 +76,22 @@ pub(super) enum UserCommand {
 		username: String,
 		/// New password for the user, if unspecified one is generated
 		password: Option<String>,
+	},
+
+	/// - Bind an email address to a local user without verification
+	AddEmail {
+		/// Local user to bind the email address to
+		username: String,
+		/// Email address to bind
+		address: String,
+	},
+
+	/// - Remove an email address binding from a local user
+	DelEmail {
+		/// Local user to remove the email address from
+		username: String,
+		/// Email address to remove
+		address: String,
 	},
 
 	/// - Deactivate a user
@@ -57,6 +125,17 @@ pub(super) enum UserCommand {
 		#[arg(short, long)]
 		/// Also deactivate admin accounts and will assume leave all rooms too
 		force: bool,
+	},
+
+	/// - Show the MSC4025 erasure state of a local user
+	Erasure {
+		user_id: String,
+	},
+
+	/// - Clear the MSC4025 erasure marker of a local user, restoring the
+	///   unredacted view of their events
+	Unerase {
+		user_id: String,
 	},
 
 	/// - Deletes a user's device.
@@ -120,6 +199,32 @@ pub(super) enum UserCommand {
 		user_id: String,
 	},
 
+	/// - Set a user profile key (display name, avatar url, etc) to a value
+	#[command(group(
+		ArgGroup::new("value_or_clear")
+			.required(true)
+			.args(["value", "clear"]),
+	))]
+	SetProfileKey {
+		/// User for whom the profile key should be set
+		user_id: String,
+
+		/// Profile key name (e.g. displayname, avatar_url, m.tz, or a custom
+		/// key)
+		key: String,
+
+		/// Value to set (used as string if not parseable as JSON)
+		value: Vec<String>,
+
+		/// Remove the profile key instead of setting a value
+		#[arg(short, long)]
+		clear: bool,
+
+		/// How to propagate the change to the user's joined rooms
+		#[arg(short, long)]
+		propagate_to: Option<PropagateTo>,
+	},
+
 	/// - Puts a room tag for the specified user and room ID.
 	///
 	/// This is primarily useful if you'd like to set your admin room
@@ -176,4 +281,18 @@ pub(super) enum UserCommand {
 		#[arg(long)]
 		yes_i_want_to_do_this: bool,
 	},
+}
+
+async fn deactivate_user(services: &Services, user_id: &UserId, no_leave_rooms: bool) -> Result {
+	if !no_leave_rooms {
+		services
+			.deactivate
+			.full_deactivate(user_id, false)
+			.boxed()
+			.await?;
+	} else {
+		services.users.deactivate_account(user_id).await?;
+	}
+
+	Ok(())
 }

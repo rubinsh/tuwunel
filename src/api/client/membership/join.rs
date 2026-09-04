@@ -1,10 +1,10 @@
 use axum::extract::State;
-use futures::FutureExt;
 use ruma::{
-	RoomId,
+	CanonicalJsonObject, CanonicalJsonValue, RoomId,
 	api::client::membership::{join_room_by_id, join_room_by_id_or_alias},
 };
 use tuwunel_core::{Result, warn};
+use tuwunel_service::membership::Join;
 
 use super::banned_room_check;
 use crate::{ClientIp, Ruma};
@@ -29,18 +29,20 @@ pub(crate) async fn join_room_by_id_route(
 
 	banned_room_check(&services, sender_user, room_id, None, client).await?;
 
+	let extra_content = extra_member_content(body.json_body.as_ref());
+
 	let mut errors = 0_usize;
 	while let Err(e) = services
 		.membership
-		.join(
+		.join(Join {
 			sender_user,
 			room_id,
-			None,
-			body.reason.clone(),
-			&[],
-			body.appservice_info.is_some(),
-		)
-		.boxed()
+			orig_room_id: None,
+			reason: body.reason.clone(),
+			servers: &[],
+			is_appservice: body.appservice_info.is_some(),
+			extra_content: extra_content.clone(),
+		})
 		.await
 	{
 		errors = errors.saturating_add(1);
@@ -82,18 +84,20 @@ pub(crate) async fn join_room_by_id_or_alias_route(
 	banned_room_check(&services, sender_user, &room_id, Some(&body.room_id_or_alias), client)
 		.await?;
 
+	let extra_content = extra_member_content(body.json_body.as_ref());
+
 	let mut errors = 0_usize;
 	while let Err(e) = services
 		.membership
-		.join(
+		.join(Join {
 			sender_user,
-			&room_id,
-			Some(&body.room_id_or_alias),
-			body.reason.clone(),
-			&servers,
-			appservice_info.is_some(),
-		)
-		.boxed()
+			room_id: &room_id,
+			orig_room_id: Some(&body.room_id_or_alias),
+			reason: body.reason.clone(),
+			servers: &servers,
+			is_appservice: appservice_info.is_some(),
+			extra_content: extra_content.clone(),
+		})
 		.await
 	{
 		errors = errors.saturating_add(1);
@@ -107,4 +111,22 @@ pub(crate) async fn join_room_by_id_or_alias_route(
 	}
 
 	Ok(join_room_by_id_or_alias::v3::Response { room_id: room_id.clone() })
+}
+
+const RESERVED_JOIN_KEYS: [&str; 3] =
+	["reason", "third_party_signed", "join_authorised_via_users_server"];
+
+// Drop recognized and server-owned keys the client must not set.
+fn extra_member_content(json_body: Option<&CanonicalJsonValue>) -> Option<CanonicalJsonObject> {
+	let CanonicalJsonValue::Object(object) = json_body? else {
+		return None;
+	};
+
+	let extra: CanonicalJsonObject = object
+		.iter()
+		.filter(|(key, _)| !RESERVED_JOIN_KEYS.contains(&key.as_str()))
+		.map(|(key, value)| (key.clone(), value.clone()))
+		.collect();
+
+	(!extra.is_empty()).then_some(extra)
 }

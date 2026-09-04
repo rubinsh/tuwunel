@@ -15,9 +15,23 @@ use tuwunel_core::{
 	Err, Error, Result, debug_warn, err, implement,
 	utils::content_disposition::make_content_disposition,
 };
+use url::Url;
 
-use super::{Dim, Media};
-use crate::federation::scheme::{FedAuth, FedPath};
+use super::{Dim, Media, preview::Agent};
+use crate::{
+	client::read_response_capped,
+	federation::scheme::{FedAuth, FedPath},
+};
+
+/// Which client fetches a media location, and as whom.
+///
+/// The client and the agent are not independent, so they travel together:
+/// only preview media carries a configured agent, and only the extern client
+/// serves federation and remote-media downloads.
+pub(super) enum Fetch {
+	Extern,
+	Preview(Agent),
+}
 
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self))]
@@ -242,7 +256,9 @@ async fn handle_content_file(&self, mxc: &Mxc<'_>, content: Content) -> Result<M
 
 #[implement(super::Service)]
 async fn handle_location(&self, mxc: &Mxc<'_>, location: &str) -> Result<Media> {
-	self.location_request(location)
+	let limit = self.services.server.config.max_response_size;
+
+	self.location_request(Fetch::Extern, location, limit)
 		.await
 		.map_err(|error| {
 			err!(Request(NotFound(
@@ -252,14 +268,53 @@ async fn handle_location(&self, mxc: &Mxc<'_>, location: &str) -> Result<Media> 
 }
 
 #[implement(super::Service)]
-async fn location_request(&self, location: &str) -> Result<Media> {
-	let response = self
+pub(super) async fn location_request(
+	&self,
+	fetch: Fetch,
+	location: &str,
+	limit: usize,
+) -> Result<Media> {
+	let url = Url::parse(location)
+		.map_err(|e| err!(Request(Unknown("Invalid media location URL: {e}"))))?;
+
+	self.check_url_host(&url)?;
+
+	let request = match fetch {
+		| Fetch::Extern => self
+			.services
+			.client
+			.extern_media
+			.get(url.as_str()),
+		| Fetch::Preview(agent) => {
+			let request = self.services.client.url_preview.get(url.as_str());
+
+			self.preview_headers(request, &url, agent)
+		},
+	};
+
+	let response = request.send().await?;
+
+	// a missing peer address cannot be screened, so fail closed
+	let Some(remote_addr) = response.remote_addr() else {
+		return Err!(Request(Forbidden("Media response has no peer address")));
+	};
+
+	if !self
 		.services
 		.client
-		.extern_media
-		.get(location)
-		.send()
-		.await?;
+		.valid_cidr_range_remote_addr(response.url(), remote_addr)
+	{
+		return Err!(Request(Forbidden("Requesting from this address is forbidden")));
+	}
+
+	// an upstream error document must not be relayed as media
+	if !response.status().is_success() {
+		return Err!(Request(NotFound(debug_warn!(
+			status = ?response.status(),
+			%url,
+			"Fetching media from location failed"
+		))));
+	}
 
 	let content_type = response
 		.headers()
@@ -275,20 +330,17 @@ async fn location_request(&self, location: &str) -> Result<Media> {
 		.map(TryFrom::try_from)
 		.and_then(Result::ok);
 
-	response
-		.bytes()
-		.await
-		.map(Vec::from)
-		.map_err(Into::into)
-		.map(|content| Media {
-			content,
-			content_type: content_type.clone(),
-			content_disposition: Some(make_content_disposition(
-				content_disposition.as_ref(),
-				content_type.as_deref(),
-				None,
-			)),
-		})
+	let content = read_response_capped(response, limit).await?;
+
+	Ok(Media {
+		content: content.to_vec(),
+		content_type: content_type.clone(),
+		content_disposition: Some(make_content_disposition(
+			content_disposition.as_ref(),
+			content_type.as_deref(),
+			None,
+		)),
+	})
 }
 
 #[implement(super::Service)]

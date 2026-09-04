@@ -1,10 +1,30 @@
-use std::env::consts::OS;
+//! Validates configuration before startup and reload.
+//!
+//! Checks reject invalid combinations while emitting warnings for deprecated or
+//! risky values. Reload validation also prevents runtime changes to fixed
+//! identity and network fields.
+
+use std::{
+	env::consts::OS,
+	fs::read_to_string,
+	net::{IpAddr, SocketAddr},
+};
 
 use either::Either;
+use http::HeaderValue;
 use itertools::Itertools;
+use regex::RegexSet;
+use url::Url;
 
-use super::{DEPRECATED_KEYS, IdentityProvider, IpSource};
-use crate::{Config, Err, Result, debug, debug_info, error, warn};
+use super::{DEPRECATED_KEYS, IdentityProvider, IpSource, KNOWN_KEYS};
+use crate::{
+	Config, Err, Result, debug, debug_info, err, error,
+	utils::{
+		is_secret_set,
+		sys::storage::{Filesystem, filesystem_from_path},
+	},
+	warn,
+};
 
 /// Performs check() with additional checks specific to reloading old config
 /// with new config.
@@ -29,19 +49,17 @@ pub fn reload(old: &Config, new: &Config) -> Result {
 	Ok(())
 }
 
+/// Validates a complete server configuration.
+///
+/// The checks reject incompatible settings and emit warnings for risky or
+/// deprecated choices. Successful validation leaves the configuration
+/// unchanged.
 pub fn check(config: &Config) -> Result {
 	#[cfg(debug_assertions)]
 	warn!("Note: tuwunel was built without optimisations (i.e. debug build)");
 
 	warn_deprecated(config);
 	warn_unknown_key(config)?;
-
-	if config.sentry && config.sentry_endpoint.is_none() {
-		return Err!(Config(
-			"sentry_endpoint",
-			"Sentry cannot be enabled without an endpoint set"
-		));
-	}
 
 	#[cfg(all(
 		feature = "hardened_malloc",
@@ -53,6 +71,35 @@ pub fn check(config: &Config) -> Result {
 		 jemalloc to be used."
 	);
 
+	check_observability(config)?;
+	check_network(config)?;
+	check_storage(config)?;
+	check_registration(config)?;
+	check_registration_terms(config)?;
+	check_turn_and_media_misc(config)?;
+	check_url_previews(config)?;
+	check_room_version(config)?;
+	check_identity_providers(config)?;
+	warn_oidc_registration_token(config);
+	check_media_providers(config)?;
+	check_well_known_support_contact_validity(config)?;
+	check_email(config)?;
+
+	Ok(())
+}
+
+fn check_observability(config: &Config) -> Result {
+	if config.sentry && config.sentry_endpoint.is_none() {
+		return Err!(Config(
+			"sentry_endpoint",
+			"Sentry cannot be enabled without an endpoint set"
+		));
+	}
+
+	Ok(())
+}
+
+fn check_network(config: &Config) -> Result {
 	#[cfg(not(unix))]
 	if config.unix_socket_path.is_some() {
 		return Err!(Config(
@@ -66,6 +113,24 @@ pub fn check(config: &Config) -> Result {
 	let key_set = config.tls.key.is_some();
 	if certs_set ^ key_set {
 		return Err!(Config("tls", "tls.certs and tls.key must either both be set or unset"));
+	}
+
+	// A non-zero depth shards the 64-char SHA-256 hex digest into `depth`
+	// segments of `length` plus a remainder, so the product must stay below 64.
+	let depth = config.conduit_media_directory_depth;
+	let length = config.conduit_media_directory_length;
+	if depth > 0 && length == 0 {
+		return Err!(Config(
+			"conduit_media_directory_length",
+			"must be non-zero when conduit_media_directory_depth is non-zero"
+		));
+	}
+	if depth > 0 && usize::from(depth).saturating_mul(usize::from(length)) >= 64 {
+		return Err!(Config(
+			"conduit_media_directory_depth",
+			"conduit_media_directory_depth times conduit_media_directory_length must be less \
+			 than 64, the length of a SHA-256 hex digest"
+		));
 	}
 
 	if let Some(source) = config.ip_source
@@ -83,52 +148,89 @@ pub fn check(config: &Config) -> Result {
 	}
 
 	if config.unix_socket_path.is_none() {
-		config.get_bind_addrs().iter().for_each(|addr| {
-			use std::path::Path;
-
-			if addr.ip().is_loopback() {
-				debug_info!(
-					"Found loopback listening address {addr}, running checks if we're in a \
-					 container."
-				);
-
-				if Path::new("/proc/vz").exists() /* Guest */ && !Path::new("/proc/bz").exists()
-				/* Host */
-				{
-					error!(
-						"You are detected using OpenVZ with a loopback/localhost listening \
-						 address of {addr}. If you are using OpenVZ for containers and you use \
-						 NAT-based networking to communicate with the host and guest, this will \
-						 NOT work. Please change this to \"0.0.0.0\". If this is expected, you \
-						 can ignore.",
-					);
-				} else if Path::new("/.dockerenv").exists() {
-					error!(
-						"You are detected using Docker with a loopback/localhost listening \
-						 address of {addr}. If you are using a reverse proxy on the host and \
-						 require communication to tuwunel in the Docker container via NAT-based \
-						 networking, this will NOT work. Please change this to \"0.0.0.0\". If \
-						 this is expected, you can ignore.",
-					);
-				} else if Path::new("/run/.containerenv").exists() {
-					error!(
-						"You are detected using Podman with a loopback/localhost listening \
-						 address of {addr}. If you are using a reverse proxy on the host and \
-						 require communication to tuwunel in the Podman container via NAT-based \
-						 networking, this will NOT work. Please change this to \"0.0.0.0\". If \
-						 this is expected, you can ignore.",
-					);
-				}
-			}
-		});
+		config
+			.get_bind_addrs()
+			.iter()
+			.for_each(warn_loopback_in_container);
 	}
 
+	for server in &config.dns_servers {
+		if server.parse::<SocketAddr>().is_err() && server.parse::<IpAddr>().is_err() {
+			return Err!(Config(
+				"dns_servers",
+				"{server:?} is not an IP address or socket address."
+			));
+		}
+	}
+
+	// check if user specified valid IP CIDR ranges on startup
+	for cidr in &config.ip_range_denylist {
+		if let Err(e) = ipaddress::IPAddress::parse(cidr) {
+			return Err!(Config(
+				"ip_range_denylist",
+				"Parsing specified IP CIDR range from string failed: {e}."
+			));
+		}
+	}
+
+	Ok(())
+}
+
+fn warn_loopback_in_container(addr: &SocketAddr) {
+	use std::path::Path;
+
+	if !addr.ip().is_loopback() {
+		return;
+	}
+
+	debug_info!(
+		"Found loopback listening address {addr}, running checks if we're in a container."
+	);
+
+	if Path::new("/proc/vz").exists() /* Guest */ && !Path::new("/proc/bz").exists()
+	/* Host */
+	{
+		error!(
+			"You are detected using OpenVZ with a loopback/localhost listening address of \
+			 {addr}. If you are using OpenVZ for containers and you use NAT-based networking to \
+			 communicate with the host and guest, this will NOT work. Please change this to \
+			 \"0.0.0.0\". If this is expected, you can ignore.",
+		);
+	} else if Path::new("/.dockerenv").exists() {
+		error!(
+			"You are detected using Docker with a loopback/localhost listening address of \
+			 {addr}. If you are using a reverse proxy on the host and require communication to \
+			 tuwunel in the Docker container via NAT-based networking, this will NOT work. \
+			 Please change this to \"0.0.0.0\". If this is expected, you can ignore.",
+		);
+	} else if Path::new("/run/.containerenv").exists() {
+		error!(
+			"You are detected using Podman with a loopback/localhost listening address of \
+			 {addr}. If you are using a reverse proxy on the host and require communication to \
+			 tuwunel in the Podman container via NAT-based networking, this will NOT work. \
+			 Please change this to \"0.0.0.0\". If this is expected, you can ignore.",
+		);
+	}
+}
+
+fn check_storage(config: &Config) -> Result {
 	// rocksdb does not allow max_log_files to be 0
 	if config.rocksdb_max_log_files == 0 {
 		return Err!(Config(
 			"max_log_files",
 			"rocksdb_max_log_files cannot be 0. Please set a value at least 1."
 		));
+	}
+
+	if config.rocksdb_allow_fallocate
+		&& let Some(filesystem) = database_filesystem(config)
+	{
+		warn!(
+			%filesystem,
+			"database_path is on a Copy-on-Write filesystem, where preallocating write-ahead \
+			 logs cannot reserve write space and can pin far more disk than the logs contain. \
+			 Set rocksdb_allow_fallocate = false."
+		);
 	}
 
 	// yeah, unless the user built a debug build hopefully for local testing only
@@ -140,6 +242,23 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
+	Ok(())
+}
+
+/// Identify the filesystem that will host the database.
+///
+/// A first boot has no `database_path` yet, since rocksdb creates it well
+/// after this check. The nearest existing ancestor stands in for it there.
+fn database_filesystem(config: &Config) -> Option<Filesystem> {
+	config
+		.database_path
+		.ancestors()
+		.map(filesystem_from_path)
+		.find_map(Result::ok)
+		.flatten()
+}
+
+fn check_registration(config: &Config) -> Result {
 	if config
 		.emergency_password
 		.as_ref()
@@ -164,7 +283,6 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
-	// check if the user specified a registration token as `""`
 	if config
 		.registration_token
 		.as_ref()
@@ -181,7 +299,7 @@ pub fn check(config: &Config) -> Result {
 		.registration_token_file
 		.as_ref()
 		.is_some_and(|path| {
-			let Ok(token) = std::fs::read_to_string(path).inspect_err(|e| {
+			let Ok(token) = read_to_string(path).inspect_err(|e| {
 				error!("Failed to read the registration token file: {e}");
 			}) else {
 				return true;
@@ -195,28 +313,12 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
-	if config.max_request_size < 10_000_000 {
-		return Err!(Config(
-			"max_request_size",
-			"Max request size is less than 10MB. Please increase it as this is too low for \
-			 operable federation."
-		));
-	}
-
-	// check if user specified valid IP CIDR ranges on startup
-	for cidr in &config.ip_range_denylist {
-		if let Err(e) = ipaddress::IPAddress::parse(cidr) {
-			return Err!(Config(
-				"ip_range_denylist",
-				"Parsing specified IP CIDR range from string failed: {e}."
-			));
-		}
-	}
+	let no_token =
+		config.registration_token.is_none() && config.registration_token_file.is_none();
 
 	if config.allow_registration
+		&& no_token
 		&& !config.yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse
-		&& config.registration_token.is_none()
-		&& config.registration_token_file.is_none()
 	{
 		return Err!(Config(
 			"registration_token",
@@ -231,9 +333,8 @@ pub fn check(config: &Config) -> Result {
 	}
 
 	if config.allow_registration
+		&& no_token
 		&& config.yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse
-		&& config.registration_token.is_none()
-		&& config.registration_token_file.is_none()
 	{
 		warn!(
 			"Open registration is enabled via setting \
@@ -242,6 +343,60 @@ pub fn check(config: &Config) -> Result {
 			 expected to be aware of the risks now. If this is not the desired behaviour, \
 			 please set a registration token."
 		);
+	}
+
+	Ok(())
+}
+
+fn check_registration_terms(config: &Config) -> Result {
+	for (id, policy) in &config.registration_terms {
+		let opaque = !id.is_empty()
+			&& id.len() <= 255
+			&& id.bytes().all(
+				|b| matches!(b, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'_' | b'~' | b'-'),
+			);
+
+		if !opaque {
+			return Err!(Config(
+				"registration_terms",
+				"Policy id {id:?} must be a non-empty opaque identifier of at most 255 \
+				 characters from [0-9a-zA-Z._~-]."
+			));
+		}
+
+		for (lang, translation) in &policy.translations {
+			if !matches!(translation.url.scheme(), "http" | "https") {
+				return Err!(Config(
+					"registration_terms",
+					"Policy {id:?} translation {lang:?} url must use the http or https scheme."
+				));
+			}
+		}
+	}
+
+	Ok(())
+}
+
+fn check_turn_and_media_misc(config: &Config) -> Result {
+	// A blank secret resolves to none at all, so it is checked the same way here.
+	if !config.turn_uris.is_empty()
+		&& !is_secret_set(config.turn_secret_file.as_deref(), config.turn_secret.as_deref())
+		&& config.turn_username.is_empty()
+		&& config.turn_password.is_empty()
+	{
+		warn!(
+			"turn_uris is configured but no credential source is set; the endpoint \
+			 /_matrix/client/v3/voip/turnServer will return empty username and password. Set \
+			 turn_secret, turn_secret_file, or both turn_username and turn_password."
+		);
+	}
+
+	if config.max_request_size < 10_000_000 {
+		return Err!(Config(
+			"max_request_size",
+			"Max request size is less than 10MB. Please increase it as this is too low for \
+			 operable federation."
+		));
 	}
 
 	if config.allow_outgoing_presence && !config.allow_local_presence {
@@ -259,37 +414,69 @@ pub fn check(config: &Config) -> Result {
 		);
 	}
 
-	if config
-		.url_preview_domain_contains_allowlist
-		.contains(&"*".to_owned())
-	{
-		warn!(
-			"All URLs are allowed for URL previews via setting \
-			 \"url_preview_domain_contains_allowlist\" to \"*\". This opens up significant \
-			 attack surface to your server. You are expected to be aware of the risks by doing \
-			 this."
-		);
+	check_thumbnails(config)?;
+	check_video_thumbnails(config)
+}
+
+fn check_thumbnails(config: &Config) -> Result {
+	if config.media_thumbnail_max_pixels == 0 {
+		return Err!(Config(
+			"media_thumbnail_max_pixels",
+			"A pixel budget of zero refuses every picture; remove the setting to take the \
+			 default."
+		));
 	}
-	if config
-		.url_preview_domain_explicit_allowlist
-		.contains(&"*".to_owned())
+
+	Ok(())
+}
+
+/// Beyond this the semaphore sizing the extractions would itself be rejected,
+/// and no host has a use for that much video decoding at once.
+const MAX_VIDEO_THUMBNAIL_CONCURRENCY: usize = 1024;
+
+fn check_video_thumbnails(config: &Config) -> Result {
+	if !(1..=MAX_VIDEO_THUMBNAIL_CONCURRENCY).contains(&config.media_video_thumbnail_concurrency)
 	{
-		warn!(
-			"All URLs are allowed for URL previews via setting \
-			 \"url_preview_domain_explicit_allowlist\" to \"*\". This opens up significant \
-			 attack surface to your server. You are expected to be aware of the risks by doing \
-			 this."
-		);
+		return Err!(Config(
+			"media_video_thumbnail_concurrency",
+			"Video thumbnail programs permitted at once must be between 1 and \
+			 {MAX_VIDEO_THUMBNAIL_CONCURRENCY}: zero leaves every extraction waiting for a slot \
+			 that never frees, and the ceiling is far past any useful degree of parallelism."
+		));
 	}
-	if config
-		.url_preview_url_contains_allowlist
-		.contains(&"*".to_owned())
-	{
-		warn!(
-			"All URLs are allowed for URL previews via setting \
-			 \"url_preview_url_contains_allowlist\" to \"*\". This opens up significant attack \
-			 surface to your server. You are expected to be aware of the risks by doing this."
-		);
+
+	if config.media_video_thumbnail_timeout == 0 {
+		return Err!(Config(
+			"media_video_thumbnail_timeout",
+			"A video thumbnail deadline of zero expires before the program can start."
+		));
+	}
+
+	Ok(())
+}
+
+fn check_url_previews(config: &Config) -> Result {
+	let wildcard = "*".to_owned();
+	let url_preview_wildcards = [
+		(
+			"url_preview_domain_contains_allowlist",
+			&config.url_preview_domain_contains_allowlist,
+		),
+		(
+			"url_preview_domain_explicit_allowlist",
+			&config.url_preview_domain_explicit_allowlist,
+		),
+		("url_preview_url_contains_allowlist", &config.url_preview_url_contains_allowlist),
+	];
+
+	for (name, list) in url_preview_wildcards {
+		if list.contains(&wildcard) {
+			warn!(
+				"All URLs are allowed for URL previews via setting \"{name}\" to \"*\". This \
+				 opens up significant attack surface to your server. You are expected to be \
+				 aware of the risks by doing this."
+			);
+		}
 	}
 
 	if let Some(Either::Right(_)) = config.url_preview_bound_interface.as_ref()
@@ -301,6 +488,22 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
+	if let Some(user_agent) = config.url_preview_user_agent.as_deref()
+		&& HeaderValue::from_str(user_agent).is_err()
+	{
+		return Err!(Config("url_preview_user_agent", "Not a valid HTTP header value."));
+	}
+
+	if let Some(user_agent) = config.url_preview_media_user_agent.as_deref()
+		&& HeaderValue::from_str(user_agent).is_err()
+	{
+		return Err!(Config("url_preview_media_user_agent", "Not a valid HTTP header value."));
+	}
+
+	Ok(())
+}
+
+fn check_room_version(config: &Config) -> Result {
 	if !config.supported_room_version(&config.default_room_version) {
 		return Err!(Config(
 			"default_room_version",
@@ -309,6 +512,21 @@ pub fn check(config: &Config) -> Result {
 		));
 	}
 
+	if config
+		.default_power_level_content_override
+		.as_ref()
+		.is_some_and(|value| !value.is_object())
+	{
+		return Err!(Config(
+			"default_power_level_content_override",
+			"must be a table (a JSON object)"
+		));
+	}
+
+	Ok(())
+}
+
+fn check_identity_providers(config: &Config) -> Result {
 	for a in config.identity_provider.values() {
 		let count = config
 			.identity_provider
@@ -327,32 +545,7 @@ pub fn check(config: &Config) -> Result {
 	}
 
 	for (i, provider) in &config.identity_provider {
-		if provider.client_secret.is_some() {
-			continue;
-		}
-
-		let Some(secret_path) = &provider.client_secret_file else {
-			return Err!(Config(
-				"client_secret",
-				"Either client secret or a client secret file must be set on identity provider \
-				 №{i}."
-			));
-		};
-
-		let Ok(secret) = std::fs::read_to_string(secret_path) else {
-			return Err!(Config(
-				"client_secret_file",
-				"Client secret file was specified but failed to be read at identity provider \
-				 №{i}"
-			));
-		};
-
-		if secret.is_empty() {
-			return Err!(Config(
-				"client_secret_file",
-				"Client secret file was specified but is empty on identity provider №{i}"
-			));
-		}
+		check_identity_provider_secret(i, provider)?;
 	}
 
 	if !config.sso_custom_providers_page
@@ -378,6 +571,88 @@ pub fn check(config: &Config) -> Result {
 		);
 	}
 
+	let mas_active = config
+		.mas_secret
+		.as_deref()
+		.is_some_and(|secret| !secret.is_empty());
+
+	if mas_active
+		&& !config
+			.identity_provider
+			.values()
+			.any(|provider| provider.brand == "mas")
+	{
+		warn!(
+			"mas_secret is set but no identity_provider is configured with `brand = MAS`. \
+			 Tuwunel is its own OpenID Connect issuer and does not delegate authentication to \
+			 MAS; the secret only authorizes MAS provisioning calls on `/_synapse/mas/`. \
+			 Logging in through MAS additionally requires an identity_provider entry with \
+			 `brand = MAS`."
+		);
+	}
+
+	if mas_active {
+		config
+			.identity_provider
+			.values()
+			.filter(|provider| provider.brand == "mas" && !provider.trusted)
+			.for_each(|provider| {
+				warn!(
+					provider = provider.id(),
+					"`mas_secret` is set and this MAS identity provider is configured without \
+					 `trusted = true`. Existing accounts provisioned by MAS will not be matched \
+					 automatically during SSO login, so users may receive separate accounts. \
+					 Set `trusted = true` only when this identity provider is the same \
+					 self-hosted MAS instance that provisions this server and you fully control \
+					 it; otherwise associate users explicitly."
+				);
+			});
+	}
+
+	Ok(())
+}
+
+fn check_identity_provider_secret(i: &str, provider: &IdentityProvider) -> Result {
+	if provider.client_secret.is_some() {
+		return Ok(());
+	}
+
+	let Some(secret_path) = &provider.client_secret_file else {
+		return Err!(Config(
+			"client_secret",
+			"Either client secret or a client secret file must be set on identity provider №{i}."
+		));
+	};
+
+	let secret = read_to_string(secret_path).map_err(|e| {
+		err!(Config(
+			"client_secret_file",
+			"Failed to read client secret file {secret_path:?} on identity provider №{i}: {e}"
+		))
+	})?;
+
+	if secret.trim().is_empty() {
+		return Err!(Config(
+			"client_secret_file",
+			"Client secret file {secret_path:?} is empty on identity provider №{i}"
+		));
+	}
+
+	Ok(())
+}
+
+fn warn_oidc_registration_token(config: &Config) {
+	if !config.oidc_registration_access_token.is_empty() {
+		warn!(
+			"oidc_registration_access_token is set, so dynamic client registration requires an \
+			 RFC 7591 initial access token. No Matrix client sends one, so next-gen auth login \
+			 will fail with `M_FORBIDDEN` for every ordinary client. Leave it empty unless \
+			 every OAuth client on this server is registered out of band."
+		);
+	}
+}
+
+fn check_media_providers(config: &Config) -> Result {
 	for provider in &config.store_media_on_providers {
 		if !config.media_storage_providers.contains(provider) {
 			return Err!(Config(
@@ -419,6 +694,90 @@ pub fn check(config: &Config) -> Result {
 	Ok(())
 }
 
+fn check_well_known_support_contact_validity(config: &Config) -> Result {
+	let well_known = &config.well_known;
+
+	if well_known.support_role.is_some()
+		&& well_known.support_email.is_none()
+		&& well_known.support_mxid.is_none()
+	{
+		return Err!(
+			"well_known.support_role is set but neither support_email nor support_mxid is \
+			 configured to accompany it"
+		);
+	}
+
+	if let Some(pgp_key) = well_known.support_pgp_key.as_deref() {
+		validate_pgp_key(pgp_key).map_err(|e| err!("well_known.support_pgp_key: {e}"))?;
+	}
+
+	for (id, contact) in &well_known.support_contact {
+		if contact.email_address.is_none() && contact.matrix_id.is_none() {
+			return Err!(
+				"well_known.support_contact.{id} has neither email_address nor matrix_id; at \
+				 least one is required"
+			);
+		}
+
+		if let Some(pgp_key) = contact.pgp_key.as_deref() {
+			validate_pgp_key(pgp_key)
+				.map_err(|e| err!("well_known.support_contact.{id}.pgp_key: {e}"))?;
+		}
+	}
+
+	Ok(())
+}
+
+fn check_email(config: &Config) -> Result {
+	let smtp = &config.smtp;
+
+	if smtp.connection_uri.is_some() && config.well_known.client.is_none() {
+		return Err!(Config(
+			"well_known.client",
+			"global.smtp is configured but well_known.client is unset. Email verification links \
+			 are built from the public client base URL, so set well_known.client to a valid \
+			 HTTPS URL alongside global.smtp."
+		));
+	}
+
+	if smtp.connection_uri.is_none()
+		&& (smtp.require_email_for_registration || smtp.require_email_for_token_registration)
+	{
+		return Err!(Config(
+			"smtp.connection_uri",
+			"global.smtp requires a verified email at registration but smtp.connection_uri is \
+			 unset. Set smtp.connection_uri so verification mail can be sent, or unset \
+			 require_email_for_registration and require_email_for_token_registration."
+		));
+	}
+
+	Ok(())
+}
+
+/// Validates an MSC4439 `pgp_key`: a URI, never inline key material.
+fn validate_pgp_key(value: &str) -> Result {
+	if value.contains("BEGIN PGP") {
+		return Err!(
+			"must be a URI, not inlined key material; publish the key and reference it by URI \
+			 (for example https://example.com/key.asc or openpgp4fpr:<fingerprint>)"
+		);
+	}
+
+	let uri = Url::parse(value).map_err(|_| {
+		err!("must be a URI; a bare fingerprint must be prefixed with `openpgp4fpr:`")
+	})?;
+
+	if uri.scheme() == "openpgp4fpr" && !valid_openpgp4fpr(uri.path()) {
+		return Err!("`openpgp4fpr:` must be followed by a 40- or 64-character hex fingerprint");
+	}
+
+	Ok(())
+}
+
+fn valid_openpgp4fpr(fpr: &str) -> bool {
+	matches!(fpr.len(), 40 | 64) && fpr.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Iterates over all the keys in the config file and warns if there is a
 /// deprecated key specified
 fn warn_deprecated(config: &Config) {
@@ -443,19 +802,18 @@ fn warn_deprecated(config: &Config) {
 /// errors if there are any.
 fn warn_unknown_key(config: &Config) -> Result {
 	debug!("Checking for unknown config keys");
+	let known_keys =
+		RegexSet::new(KNOWN_KEYS).expect("Invalid regular expression set construction");
+
 	let unknown_keys = config
 		.catchall
 		.keys()
-		.filter_map(|key| {
-			if key == "config" {
-				None
+		.filter(|key| !known_keys.is_match(key))
+		.inspect(|key| {
+			if config.error_on_unknown_config_opts {
+				error!("Config parameter \"{key}\" is unknown to tuwunel");
 			} else {
-				if config.error_on_unknown_config_opts {
-					error!("Config parameter \"{key}\" is unknown to tuwunel");
-				} else {
-					warn!("Config parameter \"{key}\" is unknown to tuwunel, ignoring.");
-				}
-				Some(key.as_str())
+				warn!("Config parameter \"{key}\" is unknown to tuwunel, ignoring.");
 			}
 		})
 		.collect_vec();

@@ -1,3 +1,8 @@
+//! Byte-size parsing, display, and integer encoding helpers.
+//!
+//! The module handles human-readable sizes alongside fixed-width big-endian
+//! counters. Its size deserializers integrate human-readable values with Serde.
+
 use bytesize::ByteSize;
 use serde::{Deserialize, Deserializer, de};
 
@@ -50,6 +55,10 @@ pub fn pretty(bytes: usize) -> String {
 	ByteSize::b(bytes).display().iec().to_string()
 }
 
+/// Increments an optional big-endian counter with wrapping arithmetic.
+///
+/// Missing or malformed input is treated as zero. The returned array contains
+/// the incremented value in big-endian byte order.
 #[inline]
 #[must_use]
 pub fn increment(old: Option<&[u8]>) -> [u8; 8] {

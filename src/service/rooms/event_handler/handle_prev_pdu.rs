@@ -1,5 +1,3 @@
-use std::{ops::Range, time::Duration};
-
 use futures::FutureExt;
 use ruma::{
 	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, RoomId, RoomVersionId, ServerName,
@@ -10,6 +8,8 @@ use tuwunel_core::{
 	debug_warn, implement,
 	matrix::{Event, PduEvent, pdu::RawPduId},
 };
+
+use super::backoff::{Context, UPGRADE_RETRY};
 
 #[implement(super::Service)]
 #[expect(clippy::too_many_arguments)]
@@ -50,13 +50,16 @@ pub(super) async fn handle_prev_pdu(
 		return Ok(None);
 	}
 
-	if self.is_backed_off(prev_id, Range {
-		start: Duration::from_mins(5),
-		end: Duration::from_hours(24),
-	}) {
+	if self
+		.is_suppressed(Context::Upgrade, prev_id, UPGRADE_RETRY)
+		.await
+		.is_deny()
+	{
 		debug!(?prev_id, "Backing off from prev_event");
 		return Ok(None);
 	}
+
+	self.record_attempt(Context::Upgrade, prev_id);
 
 	self.upgrade_outlier_to_timeline_pdu(
 		origin,

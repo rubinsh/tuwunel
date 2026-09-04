@@ -5,11 +5,20 @@ configured provider appears as an option on the client's login page. Users are
 redirected to the provider to authenticate, then returned to Tuwunel which
 maps their identity to a Matrix account.
 
+The same providers serve two login paths. Legacy clients use them directly
+through the `m.login.sso` flow. Next-generation clients reach them indirectly:
+Tuwunel's built-in [OIDC Authorization Server](oidc-server.md) is what those
+clients authenticate against, and it in turn redirects the user to a provider
+configured here to perform the actual login. A working next-gen setup therefore
+needs at least one provider on this page plus the issuer URL described on the
+OIDC server page.
+
 ### Provider guides
 
 - [Authelia](providers/authelia.md)
 - [Authentik](providers/authentik.md)
 - [Keycloak](providers/keycloak.md)
+- [Matrix Authentication Service (MAS)](providers/mas.md)
 - _Please contribute documentation for yours here!_
 
 ## Configuring Tuwunel
@@ -54,14 +63,15 @@ please refer to the section on [environment variables](#configuring-via-environm
 | `default` | `false` | Mark this provider as the default for `/_matrix/client/v3/login/sso/redirect` (the endpoint without a provider ID). Required when multiple providers are configured and some clients (e.g. FluffyChat) need a single redirect target. If exactly one provider is configured it is implicitly the default. **(Experimental)** Multiple providers can share `default = true` — all must authorize successfully in sequence. |
 | `name` | `brand` | Display name shown on the login page. Useful when multiple providers share the same brand. |
 | `icon` | brand default | MXC URI for the provider's icon. Known brands have built-in icons. |
-| `scope` | all | List of OAuth scopes to request. Empty array means all scopes configured in the provider application. Users can further restrict scopes during authorization. |
+| `scope` | `openid email profile`; MAS: `openid` | List of OAuth scopes to request. An empty array uses the default shown here. Users can further restrict scopes during authorization. |
+| `forward_action_prompt` | `false` | Forward the `action` query parameter from the SSO redirect endpoints to this provider as an OpenID Connect `prompt`. When enabled, `action=register` makes the upstream authorization request carry `prompt=create` so the provider shows its registration screen; `action=login` is left unforwarded. Only enable it for providers that support the OIDC `prompt=create` ("Initiating User Registration") extension. See [Registration hints](#registration-hints-for-oauth-aware-clients). |
 
 ### User ID mapping
 
 | Field | Default | Description |
 |---|---|---|
 | `userid_claims` | all | Claims used to compute the Matrix localpart for new registrations. When empty, Tuwunel avoids generated IDs where possible. The special value `"unique"` forces generated IDs exclusively. The claim `"sub"` takes precedence over all others when listed. |
-| `trusted` | `false` | Inverts user matching: instead of registering a new account when claims conflict with existing users, Tuwunel finds the first matching user and grants access to it. **Only set this for providers you self-host and fully control. Never use with public providers (GitHub, GitLab, Google, etc.) — it enables account takeover.** |
+| `trusted` | `false` | Inverts user matching: instead of registering a new account when claims conflict with existing users, Tuwunel finds the first matching user and grants access to it. **Only set this for providers you self-host and fully control. Never use with public providers (GitHub, GitLab, Google, etc.); it enables account takeover.** For migrated databases, prefer durable bulk adoption or individual association to temporarily enabling this option. |
 | `unique_id_fallbacks` | `true` | When no claim maps cleanly to an available username, generate a unique random localpart as a fallback. Set to `false` on private servers where random usernames are undesirable — a misconfiguration will produce an error instead. |
 | `registration` | `true` | Whether this provider can create new Matrix accounts. Set to `false` to restrict the provider to existing users only. |
 
@@ -173,11 +183,16 @@ control the identity provider.
 ```toml
 [[global.identity_provider]]
 brand = "MAS"
-client_id = "your_mas_client_id"
-client_secret = "your_mas_secret"
+client_id = "01J44Q10GR4AMTFZEEF936DTCM"
+client_secret = "<client_secret>"
 issuer_url = "https://auth.example.com"
-callback_url = "https://matrix.example.com/_matrix/client/unstable/login/sso/callback/your_mas_client_id"
+callback_url = "https://matrix.example.com/_matrix/client/unstable/login/sso/callback/01J44Q10GR4AMTFZEEF936DTCM"
 ```
+
+MAS attaches as an upstream provider; Tuwunel remains its own next-generation
+auth issuer. See the [MAS guide](providers/mas.md) for the full topology, the
+client registration on the MAS side, and why `authorization_url` must stay
+unset.
 
 ## Common setup patterns
 
@@ -244,6 +259,12 @@ unique per user.
 must complete their login before the server is restarted, or the command must
 be run again.
 
+`query oauth adopt <provider>` creates durable subject associations in bulk
+for a database migrated from a Conduit-family fork. The configured provider
+must use the same issuer and subject space as the source database. If the
+source ever changed providers, do not use the bulk command; associate each
+user individually.
+
 ### How Tuwunel derives Matrix user IDs from claims
 
 When a user authenticates through a provider for the first time and no
@@ -292,6 +313,35 @@ priority, overriding all other entries. The special value `"unique"` used
 alone instructs Tuwunel to always generate a unique random localpart and
 never attempt to derive one from claims at all.
 
+### Registration hints for OAuth-aware clients
+
+Clients that implement MSC3824 OAuth-aware login can append an `action`
+parameter to the SSO redirect endpoint to signal whether the user means to log
+in or to register:
+
+```
+/_matrix/client/v3/login/sso/redirect?action=register
+```
+
+Advertise that Tuwunel understands this flow by setting
+`oidc_aware_preferred = true` under [Global SSO options](#global-sso-options).
+
+Tuwunel only delegates the account screen to the provider: the hint is
+honored by forwarding it upstream rather than by rendering a local page. Enable
+`forward_action_prompt` on a provider and an incoming `action=register` is
+translated to the OpenID Connect `prompt=create` parameter on that provider's
+authorization request: the provider opens its sign-up screen instead of its
+sign-in screen. `action=login` and a missing `action` are left untouched; a
+`prompt` you configure through `extra_authorization_parameters` still applies in
+those cases, while for `action=register` the derived `prompt=create` takes
+precedence over it.
+
+`prompt=create` comes from the OpenID Connect "Initiating User Registration"
+extension, which not every provider implements. A provider that does not
+support it may ignore the parameter or reject the request, so the option
+defaults to off. Enable it only after confirming your provider advertises
+`create` in the `prompt_values_supported` field of its OIDC discovery metadata.
+
 ## Multiple providers
 
 When multiple providers are configured, each appears separately on the
@@ -337,6 +387,7 @@ These admin room commands help manage OAuth state:
 | `!admin query oauth show-provider <provider_id>` | Show the active configuration for a provider. |
 | `!admin query oauth show-user @user:example.com` | Show OAuth sessions for a user. |
 | `!admin query oauth associate <provider_id> @user:example.com --claim key=value` | Associate an existing Matrix account with future OAuth claims from a provider. Useful for onboarding existing users to SSO. |
+| `!admin query oauth adopt <provider_id>` | Adopt provider subjects from a migrated database. |
 | `!admin query oauth revoke <session_id\|@user:example.com>` | Revoke tokens for a session or all sessions of a user. |
 | `!admin query oauth delete <session_id\|@user:example.com>` | Remove OAuth state entirely (destructive). |
 

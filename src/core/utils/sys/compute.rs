@@ -1,4 +1,8 @@
-//! System utilities related to compute/processing
+//! CPU topology, affinity, and parallelism utilities.
+//!
+//! The helpers inspect logical-core availability and derive sibling sets for
+//! simultaneous multithreading and hardware nodes. Platform-specific
+//! implementations provide available parallelism and current-CPU data.
 
 use std::{cell::Cell, fmt::Debug, path::PathBuf, sync::LazyLock};
 
@@ -125,6 +129,11 @@ pub fn node_affinity(id: Id) -> impl Iterator<Item = Id> {
 #[must_use]
 pub fn available_parallelism() -> usize { cores_available().count() }
 
+/// Reports the number of CPUs OpenBSD currently has online.
+///
+/// The count is read from the system directly rather than from the core mask
+/// recorded at startup, and is not narrowed by process affinity, which OpenBSD
+/// does not expose.
 #[cfg(target_os = "openbsd")]
 #[inline]
 #[must_use]
@@ -145,6 +154,10 @@ pub fn is_core_available(id: Id) -> bool { cores_available().any(is_equal_to!(id
 #[inline]
 pub fn cores_available() -> impl Iterator<Item = Id> { from_mask(*CORES_AVAILABLE) }
 
+/// Returns the logical CPU currently executing the calling thread.
+///
+/// The value is a point-in-time scheduler observation and may become stale on
+/// the next instruction boundary. Linux obtains it through `sched_getcpu()`.
 #[cfg(target_os = "linux")]
 #[inline]
 pub fn getcpu() -> Result<usize> {
@@ -170,6 +183,10 @@ pub fn getcpu() -> Result<usize> {
 	math::try_into(ret)
 }
 
+/// Reports that current-CPU queries are unsupported on this platform.
+///
+/// No scheduler observation is attempted. The result contains an I/O error with
+/// the unsupported error kind.
 #[cfg(not(target_os = "linux"))]
 #[inline]
 pub fn getcpu() -> Result<usize> { Err(crate::Error::Io(std::io::ErrorKind::Unsupported.into())) }

@@ -7,7 +7,10 @@ use tuwunel_core::{
 	utils::{BoolExt, FutureBoolExt, TryFutureExtExt, future::OptionFutureExt},
 };
 
-use crate::{Ruma, client::is_ignored_pdu};
+use crate::{
+	Ruma,
+	client::{annotate_membership, is_ignored_pdu},
+};
 
 /// # `GET /_matrix/client/r0/rooms/{roomId}/event/{eventId}`
 ///
@@ -72,7 +75,7 @@ pub(crate) async fn get_room_event_route(
 	let mut event = event?;
 
 	if !visible {
-		return Err!(Request(Forbidden("You don't have permission to view this event.")));
+		return Err!(Request(NotFound("Event not found.")));
 	}
 
 	if is_ignored_pdu(&services, &event, body.sender_user()).await {
@@ -89,6 +92,18 @@ pub(crate) async fn get_room_event_route(
 	);
 
 	event.add_age().ok();
+
+	let encrypted = services
+		.state_accessor
+		.is_encrypted_room(room_id)
+		.await;
+
+	annotate_membership(&services, &mut event, sender_user, encrypted).await;
+
+	let event = services
+		.pdu_metadata
+		.bundle_aggregations(sender_user, event)
+		.await;
 
 	Ok(get_room_event::v3::Response { event: event.into_format() })
 }

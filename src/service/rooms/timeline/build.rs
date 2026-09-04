@@ -8,6 +8,7 @@ use ruma::{
 		room::member::{MembershipState, RoomMemberEventContent},
 	},
 };
+use serde_json::value::to_raw_value;
 use tuwunel_core::{
 	Err, Result, implement,
 	matrix::{event::Event, pdu::PduBuilder, room_version},
@@ -28,17 +29,19 @@ use super::RoomMutexGuard;
 )]
 pub async fn build_and_append_pdu(
 	&self,
-	pdu_builder: PduBuilder,
+	mut pdu_builder: PduBuilder,
 	sender: &UserId,
 	room_id: &RoomId,
 	state_lock: &RoomMutexGuard,
 ) -> Result<OwnedEventId> {
+	if pdu_builder.event_type == TimelineEventType::RoomMember {
+		self.sanitize_member_authorisation(&mut pdu_builder, room_id)
+			.boxed()
+			.await?;
+	}
+
 	let (pdu, mut pdu_json) = self
 		.create_hash_and_sign_event(pdu_builder, sender, room_id, state_lock)
-		.await?;
-
-	self.check_pdu_for_suspended_sender(&pdu)
-		.boxed()
 		.await?;
 
 	//TODO: Use proper room version here
@@ -81,32 +84,6 @@ pub async fn build_and_append_pdu(
 				.await?
 		{
 			return Err!(Request(Forbidden("User cannot redact this event.")));
-		}
-	}
-
-	if *pdu.kind() == TimelineEventType::RoomMember {
-		let content: RoomMemberEventContent = pdu.get_content()?;
-
-		if content.join_authorized_via_users_server.is_some()
-			&& content.membership != MembershipState::Join
-		{
-			return Err!(Request(BadJson(
-				"join_authorised_via_users_server is only for member joins"
-			)));
-		}
-
-		if content
-			.join_authorized_via_users_server
-			.as_ref()
-			.is_some_and(|authorising_user| {
-				!self
-					.services
-					.globals
-					.user_is_local(authorising_user)
-			}) {
-			return Err!(Request(InvalidParam(
-				"Authorising user does not belong to this homeserver"
-			)));
 		}
 	}
 
@@ -174,6 +151,57 @@ pub async fn build_and_append_pdu(
 
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, level = "debug")]
+async fn sanitize_member_authorisation(
+	&self,
+	pdu_builder: &mut PduBuilder,
+	room_id: &RoomId,
+) -> Result {
+	let content: RoomMemberEventContent = pdu_builder.content.deserialize_as_unchecked()?;
+
+	let Some(authorising_user) = &content.join_authorized_via_users_server else {
+		return Ok(());
+	};
+
+	if content.membership != MembershipState::Join {
+		return Err!(Request(BadJson(
+			"join_authorised_via_users_server is only for member joins"
+		)));
+	}
+
+	// Already joined or invited: strip the inapplicable authorising user.
+	if let Some(target) = pdu_builder
+		.state_key
+		.as_deref()
+		.and_then(|key| UserId::parse(key).ok())
+		&& self
+			.services
+			.state_cache
+			.user_membership(&target, room_id)
+			.await
+			.is_some_and(|m| matches!(m, MembershipState::Join | MembershipState::Invite))
+	{
+		let mut object = pdu_builder.content.deserialize()?;
+		object.remove("join_authorised_via_users_server");
+		pdu_builder.content = to_raw_value(&object)?.into();
+
+		return Ok(());
+	}
+
+	if !self
+		.services
+		.globals
+		.user_is_local(authorising_user)
+	{
+		return Err!(Request(InvalidParam(
+			"Authorising user does not belong to this homeserver"
+		)));
+	}
+
+	Ok(())
+}
+
+#[implement(super::Service)]
+#[tracing::instrument(skip_all, level = "debug")]
 async fn check_pdu_for_admin_room<Pdu>(&self, pdu: &Pdu, sender: &UserId) -> Result
 where
 	Pdu: Event,
@@ -202,8 +230,7 @@ where
 					let count = self
 						.services
 						.state_cache
-						.room_members(pdu.room_id())
-						.ready_filter(|user| self.services.globals.user_is_local(user))
+						.local_users_in_room(pdu.room_id())
 						.ready_filter(|user| *user != target)
 						.count()
 						.boxed()
@@ -226,8 +253,7 @@ where
 					let count = self
 						.services
 						.state_cache
-						.room_members(pdu.room_id())
-						.ready_filter(|user| self.services.globals.user_is_local(user))
+						.local_users_in_room(pdu.room_id())
 						.ready_filter(|user| *user != target)
 						.count()
 						.boxed()
@@ -246,67 +272,4 @@ where
 	}
 
 	Ok(())
-}
-
-/// MSC3823: reject PDUs from a suspended sender, except self-redaction of
-/// their own event or self-leave. Synapse only checks `membership == leave`
-/// and so lets suspended moderators kick others via /kick or a state PUT.
-#[implement(super::Service)]
-#[tracing::instrument(skip_all, level = "debug")]
-async fn check_pdu_for_suspended_sender<Pdu>(&self, pdu: &Pdu) -> Result
-where
-	Pdu: Event,
-{
-	if !self
-		.services
-		.users
-		.is_suspended(pdu.sender())
-		.await
-	{
-		return Ok(());
-	}
-
-	let allowed = match pdu.kind() {
-		| TimelineEventType::RoomRedaction => self.is_self_redaction(pdu).await?,
-
-		| TimelineEventType::RoomMember =>
-			pdu.get_content()
-				.map(|content: RoomMemberEventContent| {
-					content.membership == MembershipState::Leave
-						&& pdu.state_key() == Some(pdu.sender().as_str())
-				})?,
-
-		| _ => false,
-	};
-
-	if allowed {
-		return Ok(());
-	}
-
-	Err!(Request(UserSuspended("Account is suspended.")))
-}
-
-#[implement(super::Service)]
-async fn is_self_redaction<Pdu>(&self, pdu: &Pdu) -> Result<bool>
-where
-	Pdu: Event,
-{
-	let room_version = self
-		.services
-		.state
-		.get_room_version(pdu.room_id())
-		.await?;
-
-	let room_rules = room_version::rules(&room_version)?;
-
-	let Some(target_id) = pdu.redacts_id(&room_rules) else {
-		return Ok(false);
-	};
-
-	let is_self = self
-		.get_pdu(&target_id)
-		.await
-		.is_ok_and(|target| target.sender() == pdu.sender());
-
-	Ok(is_self)
 }

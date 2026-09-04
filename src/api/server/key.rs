@@ -70,15 +70,3 @@ fn expires_ts() -> MilliSecondsSinceUnixEpoch {
 	let timepoint = SystemTime::now();
 	MilliSecondsSinceUnixEpoch::from_system_time(timepoint).expect("UInt should not overflow")
 }
-
-/// # `GET /_matrix/key/v2/server/{keyId}`
-///
-/// Gets the public signing keys of this server.
-///
-/// - Matrix does not support invalidating public keys, so the key returned by
-///   this will be valid forever.
-pub(crate) async fn get_server_keys_deprecated_route(
-	State(services): State<crate::State>,
-) -> impl IntoResponse {
-	get_server_keys_route(State(services)).await
-}

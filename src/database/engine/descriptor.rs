@@ -24,7 +24,11 @@ use tuwunel_core::utils::string::EMPTY;
 
 use super::cf_opts::SENTINEL_COMPRESSION_LEVEL;
 
-/// Column Descriptor
+/// Describes a column family and its RocksDB tuning.
+///
+/// Catalog entries inherit workload presets and override fields for their key,
+/// value, cache, compaction, and compression characteristics. Lifecycle flags
+/// identify families retained only for compatibility or removal.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Descriptor {
 	pub(crate) name: &'static str,
@@ -47,6 +51,7 @@ pub(crate) struct Descriptor {
 	pub(crate) ttl: u64,
 	pub(crate) compaction: CompactionStyle,
 	pub(crate) compaction_pri: CompactionPri,
+	pub(crate) compaction_size: u64,
 	pub(crate) compression: CompressionType,
 	pub(crate) compressed_index: bool,
 	pub(crate) compression_shape: [i32; 7],
@@ -60,7 +65,10 @@ pub(crate) struct Descriptor {
 	pub(crate) auto_readahead_max: usize,
 }
 
-/// Cache Disposition
+/// Selects block-cache ownership for a column family.
+///
+/// A family can own a unique cache, join the global shared pool, or pair its
+/// cache with one named family.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CacheDisp {
 	Unique,
@@ -90,13 +98,14 @@ static BASE: Descriptor = Descriptor {
 	ttl: 60 * 60 * 24 * 21,
 	compaction: CompactionStyle::Level,
 	compaction_pri: CompactionPri::MinOverlappingRatio,
+	compaction_size: 1024 * 1024 * 64,
 	compression: CompressionType::Zstd,
 	compressed_index: true,
 	compression_shape: [0, 0, 0, 1, 1, 1, 1],
 	compression_level: SENTINEL_COMPRESSION_LEVEL,
 	bottommost_level: Some(SENTINEL_COMPRESSION_LEVEL),
 	block_index_hashing: None,
-	cache_shards: 64,
+	cache_shards: 32,
 	write_to_cache: false,
 	auto_readahead_thresh: 0,
 	auto_readahead_init: 1024 * 16,
@@ -115,8 +124,9 @@ pub(crate) static DROPPED: Descriptor = Descriptor { dropped: true, ..IGNORED };
 /// Descriptor for large datasets where writes scatter across the keyspace.
 pub(crate) static RANDOM: Descriptor = Descriptor {
 	compaction_pri: CompactionPri::OldestSmallestSeqFirst,
+	compaction_size: 1024 * 1024 * 256,
 	write_size: 1024 * 1024 * 32,
-	cache_shards: 128,
+	cache_shards: 64,
 	compression_level: -3,
 	bottommost_level: Some(2),
 	compressed_index: true,
@@ -127,10 +137,11 @@ pub(crate) static RANDOM: Descriptor = Descriptor {
 /// keyspace.
 pub(crate) static SEQUENTIAL: Descriptor = Descriptor {
 	compaction_pri: CompactionPri::OldestLargestSeqFirst,
+	compaction_size: 1024 * 1024 * 512,
 	write_size: 1024 * 1024 * 64,
 	level_size: 1024 * 1024 * 32,
 	file_size: 1024 * 1024 * 2,
-	cache_shards: 128,
+	cache_size: 1024 * 1024 * 8,
 	compression_level: -2,
 	bottommost_level: Some(2),
 	compression_shape: [0, 0, 1, 1, 1, 1, 1],
@@ -141,13 +152,13 @@ pub(crate) static SEQUENTIAL: Descriptor = Descriptor {
 /// Descriptor for small datasets where writes scatter across the keyspace.
 pub(crate) static RANDOM_SMALL: Descriptor = Descriptor {
 	compaction: CompactionStyle::Universal,
+	compaction_size: 1024 * 1024 * 128,
 	write_size: 1024 * 1024 * 16,
 	level_size: 1024 * 512,
 	file_size: 1024 * 128,
 	file_shape: 3,
 	index_size: 512,
 	block_size: 512,
-	cache_shards: 64,
 	compression_level: -4,
 	bottommost_level: Some(-1),
 	compression_shape: [0, 0, 0, 0, 0, 1, 1],
@@ -159,12 +170,12 @@ pub(crate) static RANDOM_SMALL: Descriptor = Descriptor {
 /// keyspace.
 pub(crate) static SEQUENTIAL_SMALL: Descriptor = Descriptor {
 	compaction: CompactionStyle::Universal,
+	compaction_size: 1024 * 1024 * 128,
 	write_size: 1024 * 1024 * 16,
 	level_size: 1024 * 1024,
 	file_size: 1024 * 512,
 	file_shape: 3,
 	block_size: 512,
-	cache_shards: 64,
 	block_index_hashing: Some(false),
 	compression_level: -4,
 	bottommost_level: Some(-2),
@@ -178,7 +189,7 @@ pub(crate) static SEQUENTIAL_SMALL: Descriptor = Descriptor {
 /// is reached.
 pub(crate) static RANDOM_CACHE: Descriptor = Descriptor {
 	compaction: CompactionStyle::Fifo,
-	cache_disp: CacheDisp::Unique,
+	compaction_size: 1024 * 1024 * 32,
 	limit_size: 1024 * 1024 * 1024 * 2,
 	ttl: 60 * 60 * 24 * 180,
 	..RANDOM
@@ -188,8 +199,9 @@ pub(crate) static RANDOM_CACHE: Descriptor = Descriptor {
 /// the end of the keyspace. Lowest keys are evicted off the front once
 /// `limit_size` is reached.
 pub(crate) static SEQUENTIAL_CACHE: Descriptor = Descriptor {
-	compaction: CompactionStyle::Fifo,
 	cache_disp: CacheDisp::Unique,
+	compaction: CompactionStyle::Fifo,
+	compaction_size: 1024 * 1024 * 64,
 	limit_size: 1024 * 1024 * 1024 * 2,
 	ttl: 60 * 60 * 24 * 180,
 	..SEQUENTIAL
@@ -199,9 +211,9 @@ pub(crate) static SEQUENTIAL_CACHE: Descriptor = Descriptor {
 /// keyspace. Oldest entries are evicted by FIFO compaction once `limit_size`
 /// is reached.
 pub(crate) static RANDOM_SMALL_CACHE: Descriptor = Descriptor {
-	compaction: CompactionStyle::Fifo,
-	cache_disp: CacheDisp::Unique,
 	compression: CompressionType::None,
+	compaction: CompactionStyle::Fifo,
+	compaction_size: 1024 * 1024 * 16,
 	limit_size: 1024 * 1024 * 64,
 	ttl: 60 * 60 * 24 * 180,
 	file_shape: 2,
@@ -212,9 +224,10 @@ pub(crate) static RANDOM_SMALL_CACHE: Descriptor = Descriptor {
 /// the end of the keyspace. Lowest keys are evicted off the front once
 /// `limit_size` is reached.
 pub(crate) static SEQUENTIAL_SMALL_CACHE: Descriptor = Descriptor {
-	compaction: CompactionStyle::Fifo,
 	cache_disp: CacheDisp::Unique,
 	compression: CompressionType::None,
+	compaction: CompactionStyle::Fifo,
+	compaction_size: 1024 * 1024 * 16,
 	limit_size: 1024 * 1024 * 64,
 	ttl: 60 * 60 * 24 * 180,
 	file_shape: 2,

@@ -24,7 +24,7 @@ use tuwunel_core::{
 
 use crate::Ruma;
 
-/// # `POST /_matrix/client/r0/rooms/{roomId}/members`
+/// # `GET /_matrix/client/r0/rooms/{roomId}/members`
 ///
 /// Lists all joined users in a room (TODO: at a specific point in time, with a
 /// specific membership).
@@ -70,7 +70,7 @@ pub(crate) async fn get_member_events_route(
 	})
 }
 
-/// # `POST /_matrix/client/r0/rooms/{roomId}/joined_members`
+/// # `GET /_matrix/client/r0/rooms/{roomId}/joined_members`
 ///
 /// Lists all members of a room.
 ///

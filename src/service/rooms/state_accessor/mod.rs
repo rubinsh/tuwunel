@@ -1,3 +1,4 @@
+mod erased;
 mod room_state;
 mod server_can;
 mod state;
@@ -28,7 +29,7 @@ use ruma::{
 	room::RoomType,
 };
 use tuwunel_core::{
-	Result, err, is_true,
+	Result, err,
 	matrix::{Pdu, room_version},
 	utils::BoolExt,
 };
@@ -50,7 +51,7 @@ impl crate::Service for Service {
 
 impl Service {
 	/// Gets the effective power levels of a room, regardless of if there is an
-	/// `m.rooms.power_levels` state.
+	/// `m.room.power_levels` state.
 	pub async fn get_power_levels(&self, room_id: &RoomId) -> Result<RoomPowerLevels> {
 		let create = self.get_create(room_id);
 		let power_levels = self
@@ -94,9 +95,7 @@ impl Service {
 	pub async fn is_direct(&self, room_id: &RoomId, user_id: &UserId) -> bool {
 		self.get_member(room_id, user_id)
 			.await
-			.ok()
-			.and_then(|content| content.is_direct)
-			.is_some_and(is_true!())
+			.is_ok_and(|content| content.is_direct)
 	}
 
 	pub async fn get_member(
@@ -140,7 +139,10 @@ impl Service {
 	pub async fn get_room_topic(&self, room_id: &RoomId) -> Result<String> {
 		self.room_state_get_content(room_id, &StateEventType::RoomTopic, "")
 			.await
-			.map(|c: RoomTopicEventContent| c.topic)
+			.and_then(|content: RoomTopicEventContent| {
+				plain_text_topic(content)
+					.ok_or_else(|| err!(Request(NotFound("Empty topic found in event content."))))
+			})
 	}
 
 	/// Returns the join rules for a given room (`JoinRule` type). Will default
@@ -177,4 +179,18 @@ impl Service {
 			.await
 			.is_ok()
 	}
+}
+
+/// Resolves an `m.room.topic` to its plain-text rendering: the `m.topic`
+/// block's `text/plain` representation when present (MSC3765), else the legacy
+/// `topic` field; `None` when neither yields a non-empty string.
+pub(crate) fn plain_text_topic(content: RoomTopicEventContent) -> Option<String> {
+	let topic = content
+		.topic_block
+		.text
+		.find_plain()
+		.map(ToOwned::to_owned)
+		.unwrap_or(content.topic);
+
+	topic.is_empty().is_false().then_some(topic)
 }

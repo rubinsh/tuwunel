@@ -1,25 +1,32 @@
 use std::{
-	collections::{BTreeMap, HashMap, HashSet, btree_map::Entry},
+	cmp::Reverse,
+	collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, btree_map::Entry},
 	fmt::Debug,
+	iter::once,
+	str::from_utf8,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, AtomicUsize, Ordering},
 	},
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{
 	FutureExt, StreamExt, TryFutureExt,
-	future::{BoxFuture, join3, try_join3},
+	future::{BoxFuture, join, join3, try_join3},
 	pin_mut,
 	stream::FuturesUnordered,
 };
 use ruma::{
-	MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, ServerName,
-	UserId,
+	MilliSecondsSinceUnixEpoch, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedRoomId, OwnedServerName,
+	OwnedUserId, RoomId, ServerName, UInt, UserId,
 	api::{
-		appservice::event::push_events::v1::EphemeralData,
+		appservice::event::push_events::v1::{
+			DeviceLists, EphemeralData, Request as PushEventsRequest,
+		},
+		client::push::Pusher,
+		error::ErrorKind,
 		federation::transactions::{
 			edu::{
 				DeviceListUpdateContent, Edu, PresenceContent, PresenceUpdate, ReceiptContent,
@@ -34,31 +41,48 @@ use ruma::{
 		receipt::ReceiptType,
 	},
 	presence::PresenceState,
-	push,
+	push::Ruleset,
 	serde::Raw,
 	uint,
 };
+use serde::Deserialize;
+use tokio::time::Instant as TokioInstant;
 use tuwunel_core::{
-	Error, Event, Result, debug, err, error, extract_variant,
+	Error, Event, Result, debug, debug_warn, err, error,
+	error::error_chain,
+	extract_variant, implement,
 	result::LogErr,
 	smallvec::SmallVec,
 	trace,
 	utils::{
-		BoolExt, ReadyExt, calculate_hash, continue_exponential_backoff_secs,
+		BoolExt, ReadyExt, calculate_hash, exponential_backoff_remaining_secs,
 		future::TryExtExt,
+		rand::secs as rand_secs,
 		stream::{BroadbandExt, IterStream, WidebandExt},
 	},
 	warn,
 };
 
-use super::{Destination, EduBuf, EduVec, Msg, SendingEvent, Service, data::QueueItem};
-use crate::rooms::timeline::RawPduId;
+use super::{
+	Destination, EduBuf, EduVec, Msg, SendingEvent, Service, TAG_PREFIX_LEN, data::QueueItem,
+	reap_flushes,
+};
+use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
 
+/// In-flight bookkeeping for one `Destination`. Cross-attempt backoff lives
+/// in `peer_status` (federation only); appservice/push paths keep their own
+/// status because they are not server-keyed.
 #[derive(Debug)]
 enum TransactionStatus {
 	Running,
-	Failed(u32, Instant), // number of times failed, time of last failure
+	RunningForceRetry,
+	Failed(u32, Instant), // push backoff: tries, last failure
 	Retrying(u32),        // number of times failed
+}
+
+enum RetryAction {
+	None,
+	Force,
 }
 
 type SendingError = (Destination, Error);
@@ -66,6 +90,28 @@ type SendingResult = Result<Destination, SendingError>;
 type SendingFuture<'a> = BoxFuture<'a, SendingResult>;
 type SendingFutures<'a> = FuturesUnordered<SendingFuture<'a>>;
 type CurTransactionStatus = HashMap<Destination, TransactionStatus>;
+type FailedPushIds = SmallVec<[RawPduId; 1]>;
+
+/// MSC3202 `device_one_time_keys_count`: unclaimed one-time-key counts per
+/// algorithm, keyed by user then device. Matches the ruma request field type.
+type OtkCounts =
+	BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, BTreeMap<OneTimeKeyAlgorithm, UInt>>>;
+
+/// MSC3202 `device_unused_fallback_key_types`: algorithms with an unused
+/// fallback key, keyed by user then device.
+type FallbackTypes = BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, Vec<OneTimeKeyAlgorithm>>>;
+
+/// The MSC3202-interesting devices of one transaction: the appservice
+/// sender's plus matched PDU senders' devices and the to-device recipients.
+type Devices = SmallVec<[(OwnedUserId, OwnedDeviceId); 1]>;
+
+/// Per-worker retry timer keyed by earliest-retry deadline and destination.
+///
+/// Every recorded federation or push failure arms an entry. Stale entries are
+/// consumed by the destination's in-flight or newer failure generation. The
+/// heap is bounded by concurrently failing destinations, transient federation
+/// re-arms, and stale push entries.
+type WakeQueue = BinaryHeap<Reverse<(TokioInstant, Destination)>>;
 
 /// Per-(room, user) bucket of `ReceiptData`. MSC3771 allows one receipt
 /// per thread context per user per EDU window; the dominant case is
@@ -78,10 +124,49 @@ type UserReceipts = SmallVec<[ReceiptData; 1]>;
 /// single rank.
 type RankedReceipts = SmallVec<[ReceiptMap; 1]>;
 
+/// Per-room ranked receipts gathered for one federation EDU window. The
+/// common case is a single room, so inline-1 avoids a heap touch.
+type RoomReceipts = SmallVec<[(OwnedRoomId, RankedReceipts); 1]>;
+
+/// Output of one EDU selector. `shipped` rides the current transaction up to
+/// the shared budget; `overflow` past the budget is written as queued rows for
+/// later transactions to drain.
+#[derive(Default)]
+struct Selected {
+	shipped: EduVec,
+	overflow: Vec<EduBuf>,
+}
+
+/// The appservice-injected recipient fields of a queued to-device event
+/// (MSC4203), parsed to scope MSC3202 one-time-key counts to the addressed
+/// devices.
+#[derive(Deserialize)]
+struct ToDeviceRecipient {
+	to_user_id: OwnedUserId,
+	to_device_id: OwnedDeviceId,
+}
+
+#[derive(Default)]
+struct PushFailures {
+	ids: FailedPushIds,
+	error: Option<Error>,
+}
+
+impl PushFailures {
+	fn retain(mut self, pdu_id: RawPduId, error: Error) -> Self {
+		self.ids.push(pdu_id);
+		self.error = self.error.or(Some(error));
+
+		self
+	}
+}
+
 const SELECT_PRESENCE_LIMIT: usize = 256;
 const SELECT_RECEIPT_LIMIT: usize = 256;
-const SELECT_EDU_LIMIT: usize = EDU_LIMIT - 2;
 const DEQUEUE_LIMIT: usize = 48;
+const PUSH_FAILURE_STREAK: u32 = 4;
+const WAKE_OVERFLOW_DELAY_SECS: u64 = 365 * 24 * 60 * 60;
+const WAKE_OVERFLOW_DELAY: Duration = Duration::from_secs(WAKE_OVERFLOW_DELAY_SECS);
 
 pub const PDU_LIMIT: usize = 50;
 pub const EDU_LIMIT: usize = 100;
@@ -91,12 +176,13 @@ impl Service {
 	pub(super) async fn sender(self: Arc<Self>, id: usize) -> Result {
 		let mut statuses: CurTransactionStatus = CurTransactionStatus::new();
 		let mut futures: SendingFutures<'_> = FuturesUnordered::new();
+		let mut wakes: WakeQueue = WakeQueue::new();
 
 		self.startup_netburst(id, &mut futures, &mut statuses)
 			.boxed()
 			.await;
 
-		self.work_loop(id, &mut futures, &mut statuses)
+		self.work_loop(id, &mut futures, &mut statuses, &mut wakes)
 			.await;
 
 		if !futures.is_empty() {
@@ -108,7 +194,7 @@ impl Service {
 
 	#[tracing::instrument(
 		name = "work",
-		level = "trace"
+		level = "trace",
 		skip_all,
 		fields(
 			futures = %futures.len(),
@@ -120,7 +206,10 @@ impl Service {
 		id: usize,
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
+		wakes: &mut WakeQueue,
 	) {
+		use tokio::time::{Instant, sleep_until};
+
 		let receiver = self
 			.channels
 			.get(id)
@@ -128,13 +217,20 @@ impl Service {
 			.expect("Missing channel for sender worker");
 
 		while !receiver.is_closed() {
+			let next_due = wakes
+				.peek()
+				.map_or_else(Instant::now, |Reverse((instant, _))| *instant);
+
 			tokio::select! {
 				Some(response) = futures.next() => {
-					self.handle_response(response, futures, statuses).await;
+					self.handle_response(response, futures, statuses, wakes).await;
 				},
 				request = receiver.recv_async() => match request {
 					Ok(request) => self.handle_request(request, futures, statuses).await,
 					Err(_) => return,
+				},
+				() = sleep_until(next_due), if !wakes.is_empty() => {
+					self.drain_due_wakes(futures, statuses, wakes).await;
 				},
 			}
 		}
@@ -146,29 +242,161 @@ impl Service {
 		response: SendingResult,
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
+		wakes: &mut WakeQueue,
 	) {
 		match response {
-			| Err((dest, e)) => Self::handle_response_err(dest, statuses, &e),
 			| Ok(dest) =>
 				self.handle_response_ok(&dest, futures, statuses)
 					.await,
+			| Err((dest, e)) => {
+				let retry_action = Self::handle_response_err(&dest, statuses, &e);
+
+				match dest {
+					| Destination::Federation(server) => {
+						// Arm a one-shot retry at the destination's earliest-retry time.
+						if let ShouldAttempt::No { earliest_retry } = self
+							.services
+							.federation
+							.should_attempt(&server)
+							.await
+						{
+							arm_wake(wakes, Destination::Federation(server), earliest_retry);
+						}
+					},
+					| dest @ Destination::Push(..) => {
+						let Some(status @ TransactionStatus::Failed(tries, _)) =
+							statuses.get(&dest)
+						else {
+							return;
+						};
+
+						let tries = *tries;
+						let delay = self
+							.push_backoff_remaining(Some(status))
+							.unwrap_or_default();
+						let (deadline, retry_in) = wake_deadline(delay);
+
+						Self::record_push_failure(&dest, &e, tries, retry_in);
+						wakes.push(Reverse((deadline, dest)));
+					},
+					| dest if matches!(retry_action, RetryAction::Force) =>
+						self.handle_force_retry(dest, futures, statuses)
+							.await,
+					| _ => {},
+				}
+			},
 		}
 	}
+}
 
-	fn handle_response_err(dest: Destination, statuses: &mut CurTransactionStatus, e: &Error) {
-		debug!(dest = ?dest, "{e:?}");
-		statuses.entry(dest).and_modify(|e| {
-			*e = match e {
-				| TransactionStatus::Running => TransactionStatus::Failed(1, Instant::now()),
+fn arm_wake_in(wakes: &mut WakeQueue, dest: Destination, delay: Duration) {
+	let (deadline, _) = wake_deadline(delay);
+	wakes.push(Reverse((deadline, dest)));
+}
 
-				| &mut TransactionStatus::Retrying(ref n) =>
-					TransactionStatus::Failed(n.saturating_add(1), Instant::now()),
+fn wake_deadline(delay: Duration) -> (TokioInstant, Duration) {
+	// Floor the delay at 1s so clock steps and past deadlines wake promptly.
+	let delay = delay.max(Duration::from_secs(1));
 
-				| TransactionStatus::Failed(..) => {
-					panic!("Request that was not even running failed?!")
-				},
-			}
-		});
+	// Spread the wake over another delay-width (3s minimum), so destinations
+	// sharing a backoff tier trickle back rather than retrying in one burst.
+	let jitter = rand_secs(0..delay.as_secs().max(3));
+	let now = TokioInstant::now();
+	let scheduled = delay.saturating_add(jitter);
+	let deadline = now.checked_add(scheduled).unwrap_or_else(|| {
+		now.checked_add(WAKE_OVERFLOW_DELAY)
+			.unwrap_or(now)
+	});
+	let scheduled = deadline.saturating_duration_since(now);
+
+	(deadline, scheduled)
+}
+
+#[implement(Service)]
+fn record_push_failure(dest: &Destination, error: &Error, tries: u32, retry_in: Duration) {
+	let Destination::Push(user_id, pushkey) = dest else {
+		return;
+	};
+
+	match tries {
+		| PUSH_FAILURE_STREAK => error!(
+			%user_id,
+			%pushkey,
+			streak = tries,
+			retry_in_seconds = retry_in.as_secs(),
+			chain = %error_chain(error),
+			"Push notifications for this pusher are not being delivered",
+		),
+		| _ => warn!(
+			%user_id,
+			%pushkey,
+			streak = tries,
+			retry_in_seconds = retry_in.as_secs(),
+			chain = %error_chain(error),
+			"Push transaction failed",
+		),
+	}
+}
+
+#[implement(Service)]
+#[inline]
+fn push_backoff_remaining(&self, status: Option<&TransactionStatus>) -> Option<Duration> {
+	let Some(TransactionStatus::Failed(tries, time)) = status else {
+		return None;
+	};
+
+	exponential_backoff_remaining_secs(
+		self.server.config.sender_timeout,
+		self.server.config.sender_retry_backoff_limit,
+		time.elapsed(),
+		*tries,
+	)
+}
+
+impl Service {
+	async fn handle_force_retry<'a>(
+		&'a self,
+		dest: Destination,
+		futures: &mut SendingFutures<'a>,
+		statuses: &mut CurTransactionStatus,
+	) {
+		let Ok(Some(events)) = self
+			.select_events(&dest, Vec::new(), statuses)
+			.await
+		else {
+			return;
+		};
+
+		self.schedule_events(dest, events, futures, statuses);
+	}
+
+	fn handle_response_err(
+		dest: &Destination,
+		statuses: &mut CurTransactionStatus,
+		e: &Error,
+	) -> RetryAction {
+		debug!(?dest, "{e:?}");
+		// Push backs off locally; federation defers to peer_status, appservice retries.
+		let push = matches!(dest, Destination::Push(..));
+
+		let Some(status) = statuses.get_mut(dest) else {
+			return RetryAction::None;
+		};
+
+		let (tries, retry_action) = match status {
+			| TransactionStatus::Running => (1, RetryAction::None),
+			| TransactionStatus::RunningForceRetry => (1, RetryAction::Force),
+			| TransactionStatus::Failed(n, _) | TransactionStatus::Retrying(n) =>
+				(n.saturating_add(1), RetryAction::None),
+		};
+
+		*status = if push {
+			TransactionStatus::Failed(tries, Instant::now())
+		} else {
+			TransactionStatus::Retrying(tries)
+		};
+
+		retry_action
 	}
 
 	#[expect(clippy::needless_pass_by_ref_mut)]
@@ -189,22 +417,56 @@ impl Service {
 			.collect::<Vec<_>>()
 			.await;
 
-		// Insert any pdus we found
 		if !new_events.is_empty() {
 			self.db.mark_as_active(new_events.iter());
+		}
 
-			let new_events_vec = new_events
-				.into_iter()
-				.map(|(_, event)| event)
-				.collect();
+		let mut events: Vec<SendingEvent> = new_events
+			.into_iter()
+			.map(|(_, event)| event)
+			.collect();
 
-			futures.push(self.send_events(dest.clone(), new_events_vec));
-		} else {
+		// Top up with EDUs that accrued while the transaction was in flight.
+		if let Destination::Federation(server_name) = dest {
+			let budget_used = events
+				.iter()
+				.filter(|event| matches!(event, SendingEvent::Edu(_)))
+				.count();
+
+			if let Ok(select_edus) = self.select_edus(server_name, budget_used).await {
+				events.extend(select_edus.into_iter().map(SendingEvent::Edu));
+			}
+		}
+
+		if events.is_empty() {
 			statuses.remove(dest);
+		} else {
+			if let Some(status) = statuses.get_mut(dest) {
+				*status = TransactionStatus::Running;
+			}
+
+			futures.push(self.send_events(dest.clone(), events));
 		}
 	}
 
-	#[expect(clippy::needless_pass_by_ref_mut)]
+	#[expect(
+		clippy::needless_pass_by_ref_mut,
+		reason = "mutable reference avoids requiring SendingFutures to be Sync"
+	)]
+	fn schedule_events<'a>(
+		&'a self,
+		dest: Destination,
+		events: Vec<SendingEvent>,
+		futures: &mut SendingFutures<'a>,
+		statuses: &mut CurTransactionStatus,
+	) {
+		if events.is_empty() {
+			statuses.remove(&dest);
+		} else {
+			futures.push(self.send_events(dest, events));
+		}
+	}
+
 	#[tracing::instrument(name = "request", level = "debug", skip_all)]
 	async fn handle_request<'a>(
 		&'a self,
@@ -212,13 +474,116 @@ impl Service {
 		futures: &mut SendingFutures<'a>,
 		statuses: &mut CurTransactionStatus,
 	) {
-		let iv = vec![(msg.queue_id, msg.event)];
-		if let Ok(Some(events)) = self.select_events(&msg.dest, iv, statuses).await {
-			if !events.is_empty() {
-				futures.push(self.send_events(msg.dest, events));
+		let synthetic_badge =
+			msg.queue_id.is_empty() && matches!(&msg.event, SendingEvent::BadgeRefresh);
+
+		let new_events = match (synthetic_badge, statuses.contains_key(&msg.dest)) {
+			| (false, _) => vec![(msg.queue_id, msg.event)],
+			| (true, true) => Vec::new(),
+			| (true, false) =>
+				self.db
+					.queued_requests(&msg.dest)
+					.take(DEQUEUE_LIMIT)
+					.collect()
+					.await,
+		};
+
+		if let Ok(Some(events)) = self
+			.select_events(&msg.dest, new_events, statuses)
+			.await
+		{
+			self.schedule_events(msg.dest, events, futures, statuses);
+		}
+	}
+
+	async fn drain_due_wakes<'a>(
+		&'a self,
+		futures: &mut SendingFutures<'a>,
+		statuses: &mut CurTransactionStatus,
+		wakes: &mut WakeQueue,
+	) {
+		use tokio::time::Instant;
+
+		let now = Instant::now();
+		while wakes
+			.peek()
+			.is_some_and(|Reverse((due, _))| *due <= now)
+		{
+			let Reverse((_, dest)) = wakes.pop().expect("peeked entry");
+			self.handle_wake(dest, futures, statuses, wakes)
+				.await;
+		}
+	}
+
+	async fn handle_wake<'a>(
+		&'a self,
+		dest: Destination,
+		futures: &mut SendingFutures<'a>,
+		statuses: &mut CurTransactionStatus,
+		wakes: &mut WakeQueue,
+	) {
+		let status = statuses.get(&dest);
+
+		if matches!(
+			status,
+			Some(TransactionStatus::Running | TransactionStatus::RunningForceRetry)
+		) {
+			return;
+		}
+
+		if matches!(
+			(&dest, status),
+			(Destination::Push(..), Some(TransactionStatus::Retrying(_)))
+		) {
+			trace!(?dest, "Dropping push wake while retry is in flight");
+			return;
+		}
+
+		if let (Destination::Push(..), Some(remaining)) =
+			(&dest, self.push_backoff_remaining(status))
+		{
+			if wakes
+				.iter()
+				.any(|Reverse((_, armed_dest))| armed_dest == &dest)
+			{
+				trace!(?dest, "Dropping stale push wake");
 			} else {
-				statuses.remove(&msg.dest);
+				trace!(?dest, ?remaining, "Re-arming early push wake");
+				arm_wake_in(wakes, dest, remaining);
 			}
+
+			return;
+		}
+
+		match dest {
+			| Destination::Federation(server) => {
+				let should_attempt = self
+					.services
+					.federation
+					.should_attempt(&server)
+					.await;
+
+				let dest = Destination::Federation(server);
+
+				match should_attempt {
+					| ShouldAttempt::No { earliest_retry } =>
+						arm_wake(wakes, dest, earliest_retry),
+					| _ => {
+						let msg = Msg {
+							dest,
+							event: SendingEvent::Flush,
+							queue_id: Vec::new(),
+						};
+
+						self.handle_request(msg, futures, statuses).await;
+					},
+				}
+			},
+			| dest @ Destination::Push(..) => {
+				self.handle_force_retry(dest, futures, statuses)
+					.await;
+			},
+			| Destination::Appservice(_) => {},
 		}
 	}
 
@@ -244,7 +609,7 @@ impl Service {
 				() = sleep_until(deadline) => return,
 				response = futures.next() => match response {
 					Some(Ok(dest)) => self.db.delete_all_active_requests_for(&dest).await,
-					Some(_) => continue,
+					Some(_) => {},
 					None => return,
 				},
 			}
@@ -257,7 +622,6 @@ impl Service {
 		skip_all,
 		fields(futures = %futures.len()),
 	)]
-	#[expect(clippy::needless_pass_by_ref_mut)]
 	async fn startup_netburst<'a>(
 		&'a self,
 		id: usize,
@@ -291,16 +655,39 @@ impl Service {
 				futures.push(self.send_events(dest.clone(), events));
 			}
 		}
+
+		// Active transaction generations must own their queued successors before
+		// queued-only badge destinations are woken.
+		if !self.server.config.startup_netburst || keep == 0 {
+			return;
+		}
+
+		let destinations = self
+			.db
+			.queued_badge_refresh_destinations()
+			.ready_filter(|dest| self.shard_id(dest) == id)
+			.collect::<HashSet<_>>()
+			.await;
+
+		for dest in destinations {
+			let msg = Msg {
+				dest,
+				event: SendingEvent::BadgeRefresh,
+				queue_id: Vec::new(),
+			};
+
+			self.handle_request(msg, futures, statuses).await;
+		}
 	}
 
 	#[tracing::instrument(
-		name = "select",,
+		name = "select",
 		level = "debug",
 		skip_all,
 		fields(
 			?dest,
 			new_events = %new_events.len(),
-		)
+		),
 	)]
 	async fn select_events(
 		&self,
@@ -308,14 +695,25 @@ impl Service {
 		new_events: Vec<QueueItem>, // Events we want to send: event and full key
 		statuses: &mut CurTransactionStatus,
 	) -> Result<Option<Vec<SendingEvent>>> {
-		let (allow, retry) = self.select_events_current(dest, statuses)?;
+		let retry_action = if matches!(dest, Destination::Appservice(_))
+			&& new_events
+				.iter()
+				.any(|(_, event)| matches!(event, SendingEvent::Flush))
+		{
+			RetryAction::Force
+		} else {
+			RetryAction::None
+		};
+
+		let (allow, retry) = self
+			.select_events_current(dest, statuses, retry_action)
+			.await?;
 
 		// Nothing can be done for this remote, bail out.
 		if !allow {
 			return Ok(None);
 		}
 
-		let _cork = self.db.db.cork();
 		let mut events = Vec::new();
 
 		// Must retry any previous transaction for this remote.
@@ -330,52 +728,88 @@ impl Service {
 
 		// Compose the next transaction
 		let _cork = self.db.db.cork();
-		if !new_events.is_empty() {
-			self.db.mark_as_active(new_events.iter());
-			for (_, e) in new_events {
-				events.push(e);
-			}
-		}
+		self.db
+			.retain_queued(new_events)
+			.ready_for_each(|item| {
+				self.db.mark_as_active(once(&item));
+				if !matches!(&item.1, SendingEvent::Flush) {
+					events.push(item.1);
+				}
+			})
+			.await;
 
 		// Add EDU's into the transaction
-		if let Destination::Federation(server_name) = dest
-			&& let Ok((select_edus, last_count)) = self.select_edus(server_name).await
-		{
-			debug_assert!(select_edus.len() <= EDU_LIMIT, "exceeded edus limit");
-			let select_edus = select_edus.into_iter().map(SendingEvent::Edu);
+		if let Destination::Federation(server_name) = dest {
+			let budget_used = events
+				.iter()
+				.filter(|event| matches!(event, SendingEvent::Edu(_)))
+				.count();
 
-			events.extend(select_edus);
-			self.db
-				.set_latest_educount(server_name, last_count);
+			if let Ok(select_edus) = self.select_edus(server_name, budget_used).await {
+				events.extend(select_edus.into_iter().map(SendingEvent::Edu));
+			}
 		}
 
 		Ok(Some(events))
 	}
 
-	fn select_events_current(
+	async fn select_events_current(
 		&self,
 		dest: &Destination,
 		statuses: &mut CurTransactionStatus,
+		retry_action: RetryAction,
 	) -> Result<(bool, bool)> {
+		// peer_status gates federation only; appservice and push fall through.
+		if let Destination::Federation(server) = dest {
+			let should_attempt = self
+				.services
+				.federation
+				.should_attempt(server)
+				.await;
+
+			if matches!(should_attempt, ShouldAttempt::No { .. }) {
+				return Ok((false, false));
+			}
+		}
+
 		let (mut allow, mut retry) = (true, false);
 		statuses
-			.entry(dest.clone()) // TODO: can we avoid cloning?
+			.entry(dest.clone())
 			.and_modify(|e| match e {
-				TransactionStatus::Failed(tries, time) => {
-					// Fail if a request has failed recently (exponential backoff)
+				| TransactionStatus::Running | TransactionStatus::RunningForceRetry => {
+					allow = false; // already running
+					if matches!(retry_action, RetryAction::Force) {
+						*e = TransactionStatus::RunningForceRetry;
+					}
+				},
+				| TransactionStatus::Failed(tries, time) => {
+					// Push backoff: hold off until the exponential window elapses.
 					let min = self.server.config.sender_timeout;
 					let max = self.server.config.sender_retry_backoff_limit;
-					if continue_exponential_backoff_secs(min, max, time.elapsed(), *tries)
-						&& !matches!(dest, Destination::Appservice(_))
-					{
+					let remaining =
+						exponential_backoff_remaining_secs(min, max, time.elapsed(), *tries);
+
+					trace!(
+						?dest,
+						tries = *tries,
+						?remaining,
+						"Push destination remains in backoff",
+					);
+
+					if remaining.is_some() {
 						allow = false;
 					} else {
 						retry = true;
 						*e = TransactionStatus::Retrying(*tries);
 					}
 				},
-				TransactionStatus::Running | TransactionStatus::Retrying(_) => {
-					allow = false; // already running
+				| TransactionStatus::Retrying(_) if matches!(dest, Destination::Push(..)) => {
+					allow = false; // push retry already in flight
+				},
+				| TransactionStatus::Retrying(_) => {
+					// Promote to Running so a concurrent select does not double-send.
+					retry = true;
+					*e = TransactionStatus::Running;
 				},
 			})
 			.or_insert(TransactionStatus::Running);
@@ -383,21 +817,22 @@ impl Service {
 		Ok((allow, retry))
 	}
 
-	#[tracing::instrument(
-		name = "edus",,
-		level = "debug",
-		skip_all,
-	)]
-	async fn select_edus(&self, server_name: &ServerName) -> Result<(EduVec, u64)> {
+	#[tracing::instrument(name = "edus", level = "debug", skip_all)]
+	async fn select_edus(&self, server_name: &ServerName, budget_used: usize) -> Result<EduVec> {
 		// selection window
 		let since = self.db.get_latest_educount(server_name).await;
 		let since_upper = self.services.globals.current_count();
+
+		// Nothing new since the last window: skip the scan and the watermark.
+		if since == since_upper {
+			return Ok(EduVec::new());
+		}
+
 		let batch = (since, since_upper);
 		debug_assert!(batch.0 <= batch.1, "since range must not be negative");
 
-		let events_len = AtomicUsize::default();
+		let events_len = AtomicUsize::new(budget_used);
 		let max_edu_count = AtomicU64::new(since);
-
 		let device_changes =
 			self.select_edus_device_changes(server_name, batch, &max_edu_count, &events_len);
 
@@ -405,29 +840,71 @@ impl Service {
 			.server
 			.config
 			.allow_outgoing_read_receipts
-			.then_async(|| self.select_edus_receipts(server_name, batch, &max_edu_count));
+			.then_async(|| {
+				self.select_edus_receipts(server_name, batch, &max_edu_count, &events_len)
+			});
 
 		let presence = self
 			.server
 			.config
 			.allow_outgoing_presence
-			.then_async(|| self.select_edus_presence(server_name, batch, &max_edu_count));
+			.then_async(|| {
+				self.select_edus_presence(server_name, batch, &max_edu_count, &events_len)
+			});
 
 		let (device_changes, receipts, presence) =
 			join3(device_changes, receipts, presence).await;
 
-		let mut events = device_changes;
-		events.extend(presence.into_iter().flatten());
-		events.extend(receipts.into_iter().flatten());
+		let receipts = receipts.unwrap_or_default();
+		let mut events = device_changes.shipped;
 
-		Ok((events, max_edu_count.load(Ordering::Acquire)))
+		events.extend(receipts.shipped);
+
+		// Presence rides last and is excluded from the durable prefix because
+		// its content is compose-time-relative and regenerates fresh.
+		let durable_len = events.len();
+
+		events.extend(presence.flatten());
+		debug_assert!(
+			budget_used.saturating_add(events.len()) <= EDU_LIMIT,
+			"exceeded edus limit"
+		);
+
+		// EDUs past the budget become queued rows drained by later transactions.
+		let overflow: Vec<SendingEvent> = device_changes
+			.overflow
+			.into_iter()
+			.chain(receipts.overflow)
+			.map(SendingEvent::Edu)
+			.collect();
+
+		if !overflow.is_empty() {
+			let dest = Destination::Federation(server_name.to_owned());
+			self.db
+				.queue_requests(overflow.iter().map(|event| (event, &dest)));
+		}
+
+		// Persist the durable prefix so a failed or restarted transaction
+		// replays it; the ACK deletes these active rows.
+		if durable_len > 0 {
+			self.db
+				.persist_active_edus(server_name, &events[..durable_len]);
+		}
+
+		let last_count = max_edu_count.load(Ordering::Acquire);
+		if last_count > since {
+			self.db
+				.set_latest_educount(server_name, last_count);
+		}
+
+		Ok(events)
 	}
 
 	/// Look for device changes
 	#[tracing::instrument(
 		name = "device_changes",
 		level = "trace",
-		skip(self, server_name, max_edu_count)
+		skip(self, server_name, max_edu_count, events_len)
 	)]
 	async fn select_edus_device_changes(
 		&self,
@@ -435,8 +912,8 @@ impl Service {
 		since: (u64, u64),
 		max_edu_count: &AtomicU64,
 		events_len: &AtomicUsize,
-	) -> EduVec {
-		let mut events = EduVec::new();
+	) -> Selected {
+		let mut selected = Selected::default();
 		let server_rooms = self
 			.services
 			.state_cache
@@ -476,14 +953,19 @@ impl Service {
 				serde_json::to_writer(&mut buf, &edu)
 					.expect("failed to serialize device list update to JSON");
 
-				events.push(buf);
-				if events_len.fetch_add(1, Ordering::Relaxed) >= SELECT_EDU_LIMIT - 1 {
-					return events;
+				// Past the budget these rows overflow to the queue; replay is
+				// benign because the placeholder content is user-id-only.
+				if !selected.overflow.is_empty()
+					|| events_len.fetch_add(1, Ordering::Relaxed) >= EDU_LIMIT
+				{
+					selected.overflow.push(buf);
+				} else {
+					selected.shipped.push(buf);
 				}
 			}
 		}
 
-		events
+		selected
 	}
 
 	/// Look for read receipts in this room
@@ -498,16 +980,17 @@ impl Service {
 	#[tracing::instrument(
 		name = "receipts",
 		level = "trace",
-		skip(self, server_name, max_edu_count)
+		skip(self, server_name, max_edu_count, events_len)
 	)]
 	async fn select_edus_receipts(
 		&self,
 		server_name: &ServerName,
 		since: (u64, u64),
 		max_edu_count: &AtomicU64,
-	) -> EduVec {
+		events_len: &AtomicUsize,
+	) -> Selected {
 		let num = AtomicUsize::new(0);
-		let by_room: SmallVec<[(OwnedRoomId, RankedReceipts); 1]> = self
+		let by_room: RoomReceipts = self
 			.services
 			.state_cache
 			.server_rooms(server_name)
@@ -532,9 +1015,8 @@ impl Service {
 			.max()
 			.unwrap_or(0);
 
-		let mut events = EduVec::new();
-		for rank in 0..max_rank {
-			let receipts: BTreeMap<OwnedRoomId, ReceiptMap> = by_room
+		let pivot_rank = |rank: usize| -> Option<BTreeMap<OwnedRoomId, ReceiptMap>> {
+			let receipts: BTreeMap<_, _> = by_room
 				.iter()
 				.filter_map(|(room_id, maps)| {
 					maps.get(rank)
@@ -543,19 +1025,31 @@ impl Service {
 				})
 				.collect();
 
-			if receipts.is_empty() {
-				continue;
-			}
+			receipts.is_empty().is_false().then_some(receipts)
+		};
 
-			let receipt_content = Edu::Receipt(ReceiptContent { receipts });
+		let serialize_edu = |receipts: BTreeMap<OwnedRoomId, ReceiptMap>| -> EduBuf {
 			let mut buf = EduBuf::new();
-			serde_json::to_writer(&mut buf, &receipt_content)
+			serde_json::to_writer(&mut buf, &Edu::Receipt(ReceiptContent { receipts }))
 				.expect("Failed to serialize Receipt EDU to JSON vec");
 
-			events.push(buf);
+			buf
+		};
+
+		// Ranks reserve from the shared budget in order; those past the cap
+		// overflow to the queue instead of truncating the tail.
+		let mut selected = Selected::default();
+		for receipts in (0..max_rank).filter_map(pivot_rank) {
+			if !selected.overflow.is_empty()
+				|| events_len.fetch_add(1, Ordering::Relaxed) >= EDU_LIMIT
+			{
+				selected.overflow.push(serialize_edu(receipts));
+			} else {
+				selected.shipped.push(serialize_edu(receipts));
+			}
 		}
 
-		events
+		selected
 	}
 
 	/// Look for read receipts in this room.
@@ -632,38 +1126,38 @@ impl Service {
 			}
 		}
 
-		let max_rank = by_user
-			.values()
-			.map(SmallVec::len)
-			.max()
-			.unwrap_or(0);
-
-		let mut ranked: Vec<BTreeMap<OwnedUserId, ReceiptData>> =
-			(0..max_rank).map(|_| BTreeMap::new()).collect();
-
-		for (user_id, receipts) in by_user {
-			for (rank, receipt_data) in receipts.into_iter().enumerate() {
-				ranked[rank].insert(user_id.clone(), receipt_data);
-			}
-		}
-
-		ranked
+		// Pivot per-user count-ordered receipts into rank-major
+		// `RankedReceipts`. Rank 0 carries each user's earliest receipt in
+		// the window, rank 1 the next, and so on.
+		by_user
 			.into_iter()
-			.map(|read| ReceiptMap { read })
-			.collect()
+			.fold(RankedReceipts::new(), |mut acc, (user_id, receipts)| {
+				for (rank, receipt_data) in receipts.into_iter().enumerate() {
+					if rank >= acc.len() {
+						acc.push(ReceiptMap { read: BTreeMap::new() });
+					}
+
+					acc[rank]
+						.read
+						.insert(user_id.clone(), receipt_data);
+				}
+
+				acc
+			})
 	}
 
 	/// Look for presence
 	#[tracing::instrument(
 		name = "presence",
 		level = "trace",
-		skip(self, server_name, max_edu_count)
+		skip(self, server_name, max_edu_count, events_len)
 	)]
 	async fn select_edus_presence(
 		&self,
 		server_name: &ServerName,
 		since: (u64, u64),
 		max_edu_count: &AtomicU64,
+		events_len: &AtomicUsize,
 	) -> Option<EduBuf> {
 		let presence_since = self
 			.services
@@ -723,6 +1217,11 @@ impl Service {
 			return None;
 		}
 
+		// A budget trip drops presence, which self-heals on the next transition.
+		if events_len.fetch_add(1, Ordering::Relaxed) >= EDU_LIMIT {
+			return None;
+		}
+
 		let presence_content = Edu::Presence(PresenceContent {
 			push: presence_updates.into_values().collect(),
 		});
@@ -762,30 +1261,48 @@ impl Service {
 		id: String,
 		events: Vec<SendingEvent>,
 	) -> SendingResult {
-		let Some(appservice) = self
+		let Some(info) = self
 			.services
 			.appservice
-			.get_registration(&id)
+			.get_registration_info(&id)
 			.await
 		else {
+			//TODO: appservice queue cleanup.
 			return Err((
 				Destination::Appservice(id.clone()),
-				err!(Database(warn!(?id, "Missing appservice registration"))),
+				err!(Database(debug_warn!(?id, "Missing appservice registration"))),
 			));
 		};
 
-		let mut pdu_jsons = Vec::with_capacity(
-			events
-				.iter()
-				.filter(|event| matches!(event, SendingEvent::Pdu(_)))
-				.count(),
+		let msc3202 = info.registration.msc3202_transaction_extensions;
+
+		let (pdu_count, edu_count, to_device_count, device_list_count) = events.iter().fold(
+			(0_usize, 0_usize, 0_usize, 0_usize),
+			|(pdus, edus, to_device, device_list), event| match event {
+				| SendingEvent::Pdu(_) => (pdus.saturating_add(1), edus, to_device, device_list),
+				| SendingEvent::Edu(_) => (pdus, edus.saturating_add(1), to_device, device_list),
+				| SendingEvent::ToDevice(_) =>
+					(pdus, edus, to_device.saturating_add(1), device_list),
+				| SendingEvent::DeviceListChanged(_) =>
+					(pdus, edus, to_device, device_list.saturating_add(1)),
+				| SendingEvent::BadgeRefresh | SendingEvent::Flush =>
+					(pdus, edus, to_device, device_list),
+			},
 		);
-		let mut edu_jsons: Vec<Raw<EphemeralData>> = Vec::with_capacity(
-			events
-				.iter()
-				.filter(|event| matches!(event, SendingEvent::Edu(_)))
-				.count(),
-		);
+
+		let mut pdu_jsons = Vec::with_capacity(pdu_count);
+		let mut edu_jsons: Vec<Raw<EphemeralData>> = Vec::with_capacity(edu_count);
+		let mut to_device = Vec::with_capacity(to_device_count);
+		let mut changed = Vec::with_capacity(device_list_count);
+
+		// MSC3202 one-time-key scope: the appservice sender plus (below) the
+		// namespace-matched PDU senders and to-device recipients of this txn.
+		let mut otk_users = BTreeSet::new();
+		let mut otk_recipients = BTreeSet::new();
+		if msc3202 {
+			otk_users.insert(info.sender.clone());
+		}
+
 		for event in &events {
 			match event {
 				| SendingEvent::Pdu(pdu_id) => {
@@ -795,45 +1312,168 @@ impl Service {
 						.get_pdu_from_id(pdu_id)
 						.await
 					{
+						if msc3202 && info.is_user_match(pdu.sender()) {
+							otk_users.insert(pdu.sender().to_owned());
+						}
+
 						pdu_jsons.push(pdu.to_format());
 					}
 				},
 				| SendingEvent::Edu(edu) => {
-					if appservice.receive_ephemeral
+					if info.registration.receive_ephemeral
 						&& let Ok(edu) =
 							serde_json::from_slice(edu).and_then(|edu| Raw::new(&edu))
 					{
 						edu_jsons.push(edu);
 					}
 				},
-				| SendingEvent::Flush => {}, // flush only; no new content
+				| SendingEvent::ToDevice(buf) => {
+					let Some(bytes) = buf.get(TAG_PREFIX_LEN..) else {
+						debug_warn!("skipping malformed queued to-device event");
+						continue;
+					};
+
+					if msc3202
+						&& let Ok(recipient) = serde_json::from_slice::<ToDeviceRecipient>(bytes)
+					{
+						otk_recipients.insert((recipient.to_user_id, recipient.to_device_id));
+					}
+
+					if let Ok(raw) = serde_json::from_slice(bytes) {
+						to_device.push(raw);
+					} else {
+						debug_warn!("skipping malformed queued to-device event");
+					}
+				},
+				| SendingEvent::DeviceListChanged(buf) => {
+					if msc3202
+						&& let Some(bytes) = buf.get(TAG_PREFIX_LEN..)
+						&& let Ok(user) = from_utf8(bytes)
+						&& let Ok(user_id) = UserId::parse(user)
+					{
+						changed.push(user_id);
+					}
+				},
+				| SendingEvent::BadgeRefresh | SendingEvent::Flush => {},
 			}
 		}
 
 		let txn_hash = calculate_hash(events.iter().filter_map(|e| match e {
-			| SendingEvent::Edu(b) => Some(b.as_ref()),
+			| SendingEvent::Edu(b)
+			| SendingEvent::ToDevice(b)
+			| SendingEvent::DeviceListChanged(b) => Some(b.as_ref()),
 			| SendingEvent::Pdu(b) => Some(b.as_ref()),
-			| SendingEvent::Flush => None,
+			| SendingEvent::BadgeRefresh | SendingEvent::Flush => None,
 		}));
 
 		let txn_id = &*URL_SAFE_NO_PAD.encode(txn_hash);
 
-		//debug_assert!(pdu_jsons.len() + edu_jsons.len() > 0, "sending empty
-		// transaction");
+		let (device_lists, device_one_time_keys_count, device_unused_fallback_key_types) =
+			if msc3202 {
+				changed.sort_unstable();
+				changed.dedup();
+
+				let (counts, fallbacks) = self
+					.msc3202_key_counts(otk_users, otk_recipients)
+					.await;
+
+				(DeviceLists { changed, left: Vec::new() }, counts, fallbacks)
+			} else {
+				(DeviceLists::new(), OtkCounts::new(), FallbackTypes::new())
+			};
+
+		if pdu_jsons.is_empty()
+			&& edu_jsons.is_empty()
+			&& to_device.is_empty()
+			&& device_lists.is_empty()
+			&& device_one_time_keys_count.is_empty()
+			&& device_unused_fallback_key_types.is_empty()
+		{
+			return Ok(Destination::Appservice(id));
+		}
+
 		match self
 			.services
 			.appservice
-			.send_request(appservice, ruma::api::appservice::event::push_events::v1::Request {
+			.send_request(info.registration, PushEventsRequest {
 				txn_id: txn_id.into(),
 				events: pdu_jsons,
 				ephemeral: edu_jsons,
-				to_device: Vec::new(), // TODO
+				to_device,
+				device_lists,
+				device_one_time_keys_count,
+				device_unused_fallback_key_types,
 			})
 			.await
 		{
 			| Ok(_) => Ok(Destination::Appservice(id)),
 			| Err(e) => Err((Destination::Appservice(id), e)),
 		}
+	}
+
+	/// MSC3202 one-time-key counts and unused fallback key types over every
+	/// device of `users` plus the specific `recipients`. Recomputed per build
+	/// rather than snapshotted, so a retry ships fresh counts.
+	async fn msc3202_key_counts(
+		&self,
+		users: BTreeSet<OwnedUserId>,
+		recipients: BTreeSet<(OwnedUserId, OwnedDeviceId)>,
+	) -> (OtkCounts, FallbackTypes) {
+		let mut devices: Devices = users
+			.into_iter()
+			.stream()
+			.broad_then(async |user_id: OwnedUserId| {
+				self.services
+					.users
+					.all_device_ids(&user_id)
+					.map(|device_id| (user_id.clone(), device_id.to_owned()))
+					.collect()
+					.await
+			})
+			.flat_map(|pairs: Vec<(OwnedUserId, OwnedDeviceId)>| pairs.into_iter().stream())
+			.chain(recipients.into_iter().stream())
+			.collect()
+			.await;
+
+		devices.sort_unstable();
+		devices.dedup();
+
+		devices
+			.into_iter()
+			.stream()
+			.broad_then(async |(user_id, device_id): (OwnedUserId, OwnedDeviceId)| {
+				let counts = self
+					.services
+					.users
+					.count_one_time_keys(&user_id, &device_id);
+
+				let fallbacks = self
+					.services
+					.users
+					.unused_fallback_key_algorithms(&user_id, &device_id)
+					.collect();
+
+				let (counts, fallbacks) = join(counts, fallbacks).await;
+
+				(user_id, device_id, counts, fallbacks)
+			})
+			.ready_fold(
+				(OtkCounts::new(), FallbackTypes::new()),
+				|(mut counts, mut fallbacks), (user_id, device_id, otk, fallback)| {
+					counts
+						.entry(user_id.clone())
+						.or_default()
+						.insert(device_id.clone(), otk);
+
+					fallbacks
+						.entry(user_id)
+						.or_default()
+						.insert(device_id, fallback);
+
+					(counts, fallbacks)
+				},
+			)
+			.await
 	}
 
 	#[tracing::instrument(
@@ -850,38 +1490,68 @@ impl Service {
 		pushkey: String,
 		events: Vec<SendingEvent>,
 	) -> SendingResult {
-		let suppressed = self.pushing_suppressed(&user_id).map(Ok);
+		let has_pdu = events
+			.iter()
+			.any(|event| matches!(event, SendingEvent::Pdu(_)));
 
+		let destination = || Destination::Push(user_id.clone(), pushkey.clone());
+		let suppressed = self.pushing_suppressed(&user_id).map(Ok);
 		let pusher = self
 			.services
 			.pusher
 			.get_pusher(&user_id, &pushkey)
-			.map_err(|_| {
-				(
-					Destination::Push(user_id.clone(), pushkey.clone()),
-					err!(Database(error!(?user_id, ?pushkey, "Missing pusher"))),
-				)
+			.map(|result| match result {
+				| Ok(pusher) => Ok(Some(pusher)),
+				| Err(error) if error.is_not_found() => {
+					error!(%user_id, %pushkey, "Pusher disappeared before delivery");
+
+					Ok(None)
+				},
+				| Err(error) => Err((destination(), error)),
 			});
 
-		let rules_for_user = self
-			.services
-			.account_data
-			.get_global::<PushRulesEvent>(&user_id, GlobalAccountDataEventType::PushRules)
-			.map(|ev| {
-				ev.map_or_else(
-					|_| push::Ruleset::server_default(&user_id),
-					|ev| ev.content.global,
-				)
+		let rules_for_user = has_pdu
+			.then_async(async || {
+				self.services
+					.account_data
+					.get_global::<PushRulesEvent>(&user_id, GlobalAccountDataEventType::PushRules)
+					.await
+					.map_or_else(|_| Ruleset::server_default(&user_id), |ev| ev.content.global)
 			})
 			.map(Ok);
 
 		let (pusher, rules_for_user, suppressed) =
 			try_join3(pusher, rules_for_user, suppressed).await?;
 
+		let Some(pusher) = pusher else {
+			return Ok(Destination::Push(user_id, pushkey));
+		};
+
+		// Reconciliation, not an alert: a suppressed drop strands a stale badge.
+		if events.contains(&SendingEvent::BadgeRefresh) {
+			let result = self
+				.services
+				.pusher
+				.send_badge_notice(&user_id, &pusher)
+				.await;
+
+			match result {
+				| Ok(()) => (),
+				| Err(error) if is_permanent_push_error(&error) => warn!(
+					%user_id,
+					%pushkey,
+					chain = %error_chain(&error),
+					"Dropping a badge push with a permanent local error",
+				),
+				| Err(error) => return Err((destination(), error)),
+			}
+		}
+
 		if suppressed {
 			let queued = self
 				.enqueue_suppressed_push_events(&user_id, &pushkey, &events)
 				.await;
+
 			debug!(
 				?user_id,
 				pushkey,
@@ -898,31 +1568,81 @@ impl Service {
 			"non-suppressed push",
 		);
 
-		let _sent = events
+		let failures = match rules_for_user {
+			| None => PushFailures::default(),
+			| Some(rules_for_user) =>
+				events
+					.iter()
+					.stream()
+					.ready_filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
+					.wide_filter_map(async |pdu_id| {
+						self.services
+							.timeline
+							.get_pdu_from_id(pdu_id)
+							.map_ok(|pdu| (*pdu_id, pdu))
+							.await
+							.ok()
+					})
+					.ready_filter(|(_, pdu)| !pdu.is_redacted())
+					.wide_then(async |(pdu_id, pdu)| {
+						let result = self
+							.services
+							.pusher
+							.send_push_notice(&user_id, &pusher, &rules_for_user, &pdu)
+							.await;
+
+						(pdu_id, result)
+					})
+					.ready_fold(
+						PushFailures::default(),
+						|failures, (pdu_id, result)| match result {
+							| Ok(()) => failures,
+							| Err(error) if is_permanent_push_error(&error) => {
+								warn!(
+									%user_id,
+									%pushkey,
+									?pdu_id,
+									chain = %error_chain(&error),
+									"Dropping a push with a permanent local error",
+								);
+
+								failures
+							},
+							| Err(error) => failures.retain(pdu_id, error),
+						},
+					)
+					.await,
+		};
+
+		let PushFailures { ids, error: Some(error) } = failures else {
+			return Ok(Destination::Push(user_id, pushkey));
+		};
+
+		let dest = Destination::Push(user_id, pushkey);
+
+		events
 			.iter()
-			.stream()
-			.ready_filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
-			.wide_filter_map(|pdu_id| {
-				self.services
-					.timeline
-					.get_pdu_from_id(pdu_id)
-					.ok()
-			})
-			.ready_filter(|pdu| !pdu.is_redacted())
-			.wide_filter_map(async |pdu| {
-				self.services
-					.pusher
-					.send_push_notice(&user_id, &pusher, &rules_for_user, &pdu)
-					.await
-					.map_err(|e| (Destination::Push(user_id.clone(), pushkey.clone()), e))
-					.ok()
-			})
-			.count()
-			.await;
+			.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
+			.filter(|pdu_id| !ids.contains(*pdu_id))
+			.for_each(|pdu_id| {
+				self.db
+					.delete_active_request(&dest.event_key(pdu_id));
+			});
 
-		Ok(Destination::Push(user_id, pushkey))
+		Err((dest, error))
 	}
+}
 
+#[inline]
+fn is_permanent_push_error(error: &Error) -> bool {
+	matches!(error, Error::Request(ErrorKind::InvalidParam, ..))
+}
+
+impl Service {
+	/// Schedule a flush of the pushes suppressed for one pushkey.
+	///
+	/// The flush runs as a task this service owns, so the caller never waits on
+	/// the push gateway.
 	pub fn schedule_flush_suppressed_for_pushkey(
 		&self,
 		user_id: OwnedUserId,
@@ -930,22 +1650,41 @@ impl Service {
 		reason: &'static str,
 	) {
 		let sending = self.services.sending.clone();
-		let runtime = self.server.runtime();
-		runtime.spawn(async move {
+
+		self.spawn_flush(async move {
 			sending
 				.flush_suppressed_for_pushkey(user_id, pushkey, reason)
 				.await;
 		});
 	}
 
+	/// Schedule a flush of the pushes suppressed for every pushkey a user owns.
+	///
+	/// The flush runs as a task this service owns, so the caller never waits on
+	/// the push gateway.
 	pub fn schedule_flush_suppressed_for_user(&self, user_id: OwnedUserId, reason: &'static str) {
 		let sending = self.services.sending.clone();
-		let runtime = self.server.runtime();
-		runtime.spawn(async move {
+
+		self.spawn_flush(async move {
 			sending
 				.flush_suppressed_for_user(user_id, reason)
 				.await;
 		});
+	}
+
+	fn spawn_flush<F>(&self, flush: F)
+	where
+		F: Future<Output = ()> + Send + 'static,
+	{
+		// A flush scheduled during shutdown is dropped, not spawned.
+		if !self.server.is_running() {
+			return;
+		}
+
+		let mut flushes = self.flushes.lock().expect("locked");
+
+		reap_flushes(&mut flushes);
+		let _abort = flushes.spawn_on(flush, self.server.runtime());
 	}
 
 	async fn enqueue_suppressed_push_events(
@@ -992,8 +1731,8 @@ impl Service {
 		&self,
 		user_id: &UserId,
 		pushkey: &str,
-		pusher: &ruma::api::client::push::Pusher,
-		rules_for_user: &push::Ruleset,
+		pusher: &Pusher,
+		rules_for_user: &Ruleset,
 		rooms: Vec<(OwnedRoomId, Vec<RawPduId>)>,
 		reason: &'static str,
 	) {
@@ -1010,6 +1749,7 @@ impl Service {
 				.pusher
 				.notification_count(user_id, &room_id)
 				.await;
+
 			if unread == 0 {
 				trace!(?user_id, ?room_id, "Skipping suppressed push flush: no unread");
 				continue;
@@ -1041,6 +1781,7 @@ impl Service {
 						.services
 						.pusher
 						.queue_suppressed_push(user_id, pushkey, &room_id, pdu_id);
+
 					warn!(
 						?user_id,
 						?room_id,
@@ -1067,6 +1808,7 @@ impl Service {
 			.services
 			.pusher
 			.take_suppressed_for_pushkey(&user_id, &pushkey);
+
 		if suppressed.is_empty() {
 			return;
 		}
@@ -1091,7 +1833,7 @@ impl Service {
 			.await
 		{
 			| Ok(ev) => ev.content.global,
-			| Err(_) => push::Ruleset::server_default(&user_id),
+			| Err(_) => Ruleset::server_default(&user_id),
 		};
 
 		self.flush_suppressed_rooms(
@@ -1110,6 +1852,7 @@ impl Service {
 			.services
 			.pusher
 			.take_suppressed_for_user(&user_id);
+
 		if suppressed.is_empty() {
 			return;
 		}
@@ -1121,7 +1864,7 @@ impl Service {
 			.await
 		{
 			| Ok(ev) => ev.content.global,
-			| Err(_) => push::Ruleset::server_default(&user_id),
+			| Err(_) => Ruleset::server_default(&user_id),
 		};
 
 		for (pushkey, rooms) in suppressed {
@@ -1217,16 +1960,18 @@ impl Service {
 	) -> SendingResult {
 		let pdus: Vec<_> = events
 			.iter()
-			.filter_map(|pdu| match pdu {
-				| SendingEvent::Pdu(pdu) => Some(pdu),
-				| _ => None,
-			})
+			.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
 			.stream()
 			.wide_filter_map(|pdu_id| {
 				self.services
 					.timeline
 					.get_pdu_json_from_id(pdu_id)
 					.ok()
+			})
+			.wide_then(|pdu| {
+				self.services
+					.state_accessor
+					.erased_for_server(&server, pdu)
 			})
 			.wide_then(|pdu| {
 				self.services
@@ -1281,8 +2026,16 @@ impl Service {
 		}
 
 		match result {
-			| Err(error) => Err((Destination::Federation(server), error)),
 			| Ok(_) => Ok(Destination::Federation(server)),
+			| Err(error) => Err((Destination::Federation(server), error)),
 		}
 	}
+}
+
+fn arm_wake(wakes: &mut WakeQueue, dest: Destination, earliest_retry: SystemTime) {
+	let delay = earliest_retry
+		.duration_since(SystemTime::now())
+		.unwrap_or_default();
+
+	arm_wake_in(wakes, dest, delay);
 }

@@ -1,14 +1,18 @@
 use std::collections::BTreeMap;
 
 use axum::extract::State;
+#[expect(deprecated)]
+use ruma::api::client::discovery::get_capabilities::v3::{
+	SetAvatarUrlCapability, SetDisplayNameCapability,
+};
 use ruma::{
 	RoomVersionId,
 	api::client::discovery::{
 		get_capabilities,
 		get_capabilities::v3::{
 			AccountModerationCapability, Capabilities, ChangePasswordCapability,
-			GetLoginTokenCapability, ProfileFieldsCapability, RoomVersionStability,
-			RoomVersionsCapability, ThirdPartyIdChangesCapability,
+			ForgetForcedUponLeaveCapability, GetLoginTokenCapability, ProfileFieldsCapability,
+			RoomVersionStability, RoomVersionsCapability, ThirdPartyIdChangesCapability,
 		},
 	},
 };
@@ -21,6 +25,7 @@ use crate::Ruma;
 ///
 /// Get information on the supported feature set and other relevant capabilities
 /// of this server.
+#[expect(deprecated)]
 pub(crate) async fn get_capabilities_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_capabilities::v3::Request>,
@@ -40,8 +45,13 @@ pub(crate) async fn get_capabilities_route(
 			.clone(),
 	};
 
-	// we do not implement 3PID stuff
-	capabilities.thirdparty_id_changes = ThirdPartyIdChangesCapability { enabled: false };
+	// MSC3283: deprecated displayname/avatar capabilities for pre-1.16 clients.
+	capabilities.set_displayname = SetDisplayNameCapability::new(true);
+	capabilities.set_avatar_url = SetAvatarUrlCapability::new(true);
+
+	// 3PID add/remove is available only when the email subsystem can send.
+	capabilities.thirdparty_id_changes =
+		ThirdPartyIdChangesCapability { enabled: services.sendmail.is_enabled() };
 
 	capabilities.get_login_token = GetLoginTokenCapability {
 		enabled: services.server.config.login_via_existing_session,
@@ -53,10 +63,36 @@ pub(crate) async fn get_capabilities_route(
 		enabled: services.server.config.login_with_password,
 	};
 
+	capabilities.forget_forced_upon_leave =
+		ForgetForcedUponLeaveCapability::new(services.config.forget_forced_upon_leave);
+
 	capabilities.set(
 		"org.matrix.msc4267.forget_forced_upon_leave",
 		json!({"enabled": services.config.forget_forced_upon_leave}),
 	)?;
+
+	// MSC4452: enabled mirrors the per-URL gate; empty allowlists 403 every URL.
+	let preview_url_enabled = !services
+		.config
+		.url_preview_domain_contains_allowlist
+		.is_empty()
+		|| !services
+			.config
+			.url_preview_domain_explicit_allowlist
+			.is_empty()
+		|| !services
+			.config
+			.url_preview_url_contains_allowlist
+			.is_empty();
+
+	capabilities
+		.set("io.element.msc4452.preview_url", json!({"enabled": preview_url_enabled}))?;
+
+	// MSC3664: absent rather than present-and-disabled, since a client testing
+	// for the key rather than its value would otherwise read support.
+	if services.config.msc3664_related_event_match {
+		capabilities.set("im.nheko.msc3664.related_event_match", json!({"enabled": true}))?;
+	}
 
 	// MSC4323: advertise admin moderation only to admins; absence implies
 	// neither suspend nor lock is available to the caller.

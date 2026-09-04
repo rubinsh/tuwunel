@@ -48,7 +48,7 @@ on:
         description: Override nightly toolchain with more specific nightly.
       checkout:
         type: string
-        default: 'HEAD'
+        default: ${{github.sha}}
         description: Specific commit to checkout
       max-parallel:
         type: number
@@ -119,9 +119,9 @@ jobs:
         machine: ${{fromJSON(inputs.machines)}}
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
       with:
-        ref: ${{inputs.checkout}}
+        ref: ${{inputs.checkout || github.sha}}
         fetch-depth: 1
         fetch-tags: true
         persist-credentials: false
@@ -204,6 +204,23 @@ jobs:
         mkdir -p "_artifact"
         mv "$src" "_artifact/$dst"
         chmod "$mod" "_artifact/$dst"
+
+    # Tar an extracted directory for downstream Compress/Upload steps
+    - name: Tar Directory Artifact
+      if: >
+        !failure() && !cancelled()
+        && fromJSON(inputs.artifact)[matrix.bake_target].dst
+        && fromJSON(inputs.artifact)[matrix.bake_target].dir == true
+
+      env:
+        dst: ${{ fromJSON(inputs.artifact)[matrix.bake_target].dst }}
+
+      run: |
+        if test -d "_artifact/$dst"; then
+          tar -cf "_artifact/$dst.tar" -C "_artifact" "$dst"
+          rm -rf "_artifact/$dst"
+          mv "_artifact/$dst.tar" "_artifact/$dst"
+        fi
 
     # Optionally compress extracted artifact
     - name: Compress Artifact

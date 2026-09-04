@@ -2,17 +2,18 @@
 //!
 //! Custom Tuwunel endpoint for matrix-channel-style ephemeral events
 //! (e.g. `com.shai.matrix-channel.bot_activity`). The body is the event
-//! `content` (any JSON object). Each PUT appends an entry to a bounded
-//! per-room ring queue keyed by `(event_type, sender)`; the room's
+//! `content` (any JSON object). Each PUT appends an entry carrying its
+//! event type and sender to a bounded per-room ring queue; the room's
 //! `room.ephemeral.events` on the next `/sync` carries every entry
 //! whose counter exceeds the request's `since` (capped at
 //! `next_batch`).
 //!
 //! Requirements:
 //!   - Bearer token (user or appservice). Expired user tokens are rejected; the
-//!     standard router auth path applies the same check.
+//!     standard router auth path applies the same check. Locked accounts are
+//!     rejected as they are on standard authenticated routes.
 //!   - `event_type` is in `config.allowed_ephemeral_types`.
-//!   - Sender is joined to `room_id` (or appservice).
+//!   - Sender is joined to `room_id`, including the appservice sender user.
 //!
 //! No federation, no DB persistence. A clear is just a PUT with whatever
 //! "cleared" content the caller wants the next `/sync` to surface
@@ -65,6 +66,7 @@ pub(crate) async fn put_ephemeral_event_route(
 		| Sender::User(u) => u,
 		| Sender::Appservice(asu) => asu,
 	};
+	services.users.locked_check(&sender_user).await?;
 
 	if !services
 		.state_cache

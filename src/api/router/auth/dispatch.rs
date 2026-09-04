@@ -1,18 +1,18 @@
 use std::any::TypeId;
 
 use ruma::{
-	CanonicalJsonValue, OwnedDeviceId, OwnedUserId,
+	CanonicalJsonValue,
 	api::{
 		auth_scheme::{
 			AccessToken, AccessTokenOptional, AppserviceToken, AppserviceTokenOptional,
 			AuthScheme, NoAccessToken, NoAuthentication,
 		},
-		client::voip::get_turn_server_info,
+		client::{account::change_password, rtc::transports},
 		error::{ErrorKind, UnknownTokenErrorData},
-		federation::{authentication::ServerSignatures, openid::get_openid_userinfo},
+		federation::authentication::ServerSignatures,
 	},
 };
-use tuwunel_core::{Err, Error, Result, utils::result::LogDebugErr};
+use tuwunel_core::{Err, Error, Result};
 use tuwunel_service::Services;
 
 use super::{Auth, Request, Token, appservice::auth_appservice, server::auth_server};
@@ -69,26 +69,16 @@ impl AuthDispatch for NoAuthentication {
 	const SCHEME: Scheme = Scheme::None;
 
 	async fn dispatch(
-		services: &Services,
-		request: &mut Request,
+		_services: &Services,
+		_request: &mut Request,
 		_json_body: Option<&CanonicalJsonValue>,
 		token: Token,
-		route: TypeId,
+		_route: TypeId,
 	) -> Result<Auth> {
 		match token {
-			| Token::Invalid
-				if request.query.access_token.is_some()
-					&& route == TypeId::of::<get_openid_userinfo::v1::Request>() =>
-			{
-				// OpenID federation endpoint uses a query param with the same name; drop
-				// once query params for user auth are removed from the spec. Required to
-				// make the integration manager work.
-				Ok(Auth::default())
-			},
-
-			| Token::Invalid => unknown_token(),
-			| Token::Expired((user_id, device_id)) =>
-				expired_token(services, user_id, device_id).await,
+			// check_auth_still_required already enforced any auth-required config for
+			// these no-auth routes, so a stale or unknown token serves anonymously.
+			| Token::Invalid | Token::Expired(_) | Token::None => Ok(Auth::default()),
 
 			| Token::User(user) => Ok(Auth {
 				sender_user: Some(user.0),
@@ -101,8 +91,6 @@ impl AuthDispatch for NoAuthentication {
 				appservice_info: Some(*info),
 				..Auth::default()
 			}),
-
-			| Token::None => Ok(Auth::default()),
 		}
 	}
 }
@@ -119,8 +107,7 @@ impl AuthDispatch for AccessToken {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired((user_id, device_id)) =>
-				expired_token(services, user_id, device_id).await,
+			| Token::Expired(access_token) => expired_token(services, &access_token).await,
 			| Token::Appservice(info) => Ok(auth_appservice(services, request, info).await?),
 			| Token::User(user) => Ok(Auth {
 				sender_user: Some(user.0),
@@ -128,14 +115,21 @@ impl AuthDispatch for AccessToken {
 				_expires_at: user.2,
 				..Auth::default()
 			}),
-			| Token::None
-				if route == TypeId::of::<get_turn_server_info::v3::Request>()
-					&& services.server.config.turn_allow_guests =>
-				Ok(Auth::default()),
+			| Token::None if allows_missing_access_token(route) => Ok(Auth::default()),
 
 			| Token::None => Err!(Request(MissingToken("Missing access token."))),
 		}
 	}
+}
+
+/// Allow endpoints with a dedicated unauthenticated authorization path through
+/// the request authentication gate.
+///
+/// Transport discovery exposes only configured public metadata. Password reset
+/// derives its target from a validated and bound email proof in the route.
+fn allows_missing_access_token(route: TypeId) -> bool {
+	route == TypeId::of::<transports::v1::Request>()
+		|| route == TypeId::of::<change_password::v3::Request>()
 }
 
 impl AuthDispatch for AccessTokenOptional {
@@ -150,8 +144,7 @@ impl AuthDispatch for AccessTokenOptional {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired((user_id, device_id)) =>
-				expired_token(services, user_id, device_id).await,
+			| Token::Expired(access_token) => expired_token(services, &access_token).await,
 			| Token::User(user) => Ok(Auth {
 				sender_user: Some(user.0),
 				sender_device: Some(user.1),
@@ -179,8 +172,7 @@ impl AuthDispatch for AppserviceToken {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired((user_id, device_id)) =>
-				expired_token(services, user_id, device_id).await,
+			| Token::Expired(access_token) => expired_token(services, &access_token).await,
 			| Token::User(_) =>
 				Err!(Request(Unauthorized("Appservice tokens must be used on this endpoint."))),
 			| Token::Appservice(info) => Ok(Auth {
@@ -204,8 +196,7 @@ impl AuthDispatch for AppserviceTokenOptional {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired((user_id, device_id)) =>
-				expired_token(services, user_id, device_id).await,
+			| Token::Expired(access_token) => expired_token(services, &access_token).await,
 			| Token::User(user) => Ok(Auth {
 				sender_user: Some(user.0),
 				sender_device: Some(user.1),
@@ -233,8 +224,7 @@ impl AuthDispatch for ServerSignatures {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired((user_id, device_id)) =>
-				expired_token(services, user_id, device_id).await,
+			| Token::Expired(access_token) => expired_token(services, &access_token).await,
 			| Token::Appservice(_) | Token::User(_) =>
 				Err!(Request(Unauthorized("Server signatures must be used on this endpoint."))),
 			| Token::None => Ok(auth_server(services, request, json_body).await?),
@@ -249,20 +239,28 @@ fn unknown_token() -> Result<Auth> {
 	))
 }
 
-async fn expired_token(
-	services: &Services,
-	user_id: OwnedUserId,
-	device_id: OwnedDeviceId,
-) -> Result<Auth> {
+async fn expired_token(services: &Services, access_token: &str) -> Result<Auth> {
 	services
 		.users
-		.remove_access_token(&user_id, &device_id)
-		.await
-		.log_debug_err()
-		.ok();
+		.remove_access_token_value(access_token)
+		.await;
 
 	Err(Error::BadRequest(
 		ErrorKind::UnknownToken(UnknownTokenErrorData { soft_logout: true }),
 		"Expired access token.",
 	))
+}
+
+#[cfg(test)]
+mod tests {
+	use ruma::api::client::discovery::get_supported_versions;
+
+	use super::*;
+
+	#[test]
+	fn dedicated_routes_bypass_access_token_auth() {
+		assert!(allows_missing_access_token(TypeId::of::<transports::v1::Request>()));
+		assert!(allows_missing_access_token(TypeId::of::<change_password::v3::Request>()));
+		assert!(!allows_missing_access_token(TypeId::of::<get_supported_versions::Request>()));
+	}
 }

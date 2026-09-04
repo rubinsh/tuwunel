@@ -29,7 +29,7 @@ pub(crate) use self::{
 };
 use crate::Ruma;
 
-/// # `POST /_matrix/client/r0/joined_rooms`
+/// # `GET /_matrix/client/r0/joined_rooms`
 ///
 /// Lists all rooms the user has joined.
 pub(crate) async fn joined_rooms_route(
@@ -108,9 +108,7 @@ async fn maybe_deactivate(services: &Services, user_id: &UserId, client_ip: IpAd
 
 		warn!("{notice}");
 
-		if services.server.config.admin_room_notices {
-			services.admin.send_text(&notice).await;
-		}
+		services.admin.notify_loud(&notice).await;
 
 		services
 			.deactivate

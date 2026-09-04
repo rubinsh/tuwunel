@@ -6,7 +6,7 @@ use tuwunel_core::{
 	Err, Result, debug, debug_info, err, implement,
 	matrix::{Event, PduEvent, event::TypeExt, room_version},
 	ref_at, trace,
-	utils::{future::TryExtExt, stream::IterStream},
+	utils::{ReadyExt, future::TryExtExt, stream::IterStream},
 	warn,
 };
 
@@ -121,13 +121,11 @@ pub(super) async fn handle_outlier_pdu(
 				.inspect_err(move |e| warn!("Missing auth_event {auth_event_id}: {e}"))
 				.ok()
 		})
-		.map(|auth_event| {
+		.ready_filter_map(|auth_event| {
+			let state_key = auth_event.state_key()?;
 			let event_type = auth_event.event_type();
-			let state_key = auth_event
-				.state_key()
-				.expect("all auth events have state_key");
 
-			(event_type.with_state_key(state_key), auth_event)
+			Some((event_type.with_state_key(state_key), auth_event))
 		})
 		.collect()
 		.await;

@@ -1,5 +1,3 @@
-use std::borrow::Borrow;
-
 use futures::{
 	Stream, TryFutureExt, TryStreamExt,
 	future::Either::{Left, Right},
@@ -21,6 +19,15 @@ use super::{PduId, RawPduId};
 
 pub type PdusIterItem = (PduCount, PduEvent);
 
+/// Offset-binary `u64` of a PDU count, so key order matches signed value order
+/// (backfilled negatives sort below normal positives).
+#[must_use]
+pub fn bias_count(count: [u8; 8]) -> u64 {
+	i64::from_be_bytes(count)
+		.wrapping_sub(i64::MIN)
+		.cast_unsigned()
+}
+
 #[implement(super::Service)]
 pub async fn delete_pdus(&self, room_id: &RoomId) -> Result {
 	let current = self
@@ -37,10 +44,16 @@ pub async fn delete_pdus(&self, room_id: &RoomId) -> Result {
 			let ts: u64 = pdu.origin_server_ts.into();
 			let event_id = &pdu.event_id;
 
-			self.db.pduid_pdu.remove(key);
-			self.db.eventid_pduid.remove(event_id);
-			self.db.eventid_outlierpdu.remove(event_id);
-			self.db.roomid_ts_pducount.del((room_id, ts));
+			let mut txn = self.db.db.txn();
+
+			txn.del_raw(&self.db.pduid_pdu, key);
+			txn.del_raw(&self.db.eventid_pduid, event_id);
+			txn.del_raw(&self.db.eventid_outlierpdu, event_id);
+
+			let room_id_ts_key = (room_id, ts, bias_count(RawPduId::from(key).count()));
+			txn.del(&self.db.roomid_tscount_pducount, room_id_ts_key);
+
+			txn.execute();
 
 			trace!(?event_id, ?room_id, ?ts, ?key, "Removed");
 
@@ -76,10 +89,9 @@ pub fn pdu_ids_near_ts(
 ) -> impl Stream<Item = Result<(MilliSecondsSinceUnixEpoch, PduId)>> + Send {
 	use Direction::{Backward, Forward};
 
-	type KeyVal<'a> = ((&'a RoomId, UInt), i64);
+	type KeyVal<'a> = ((&'a RoomId, UInt, u64), i64);
 
 	let ts: u64 = ts.get().into();
-	let key = (room_id, ts);
 
 	self.services
 		.short
@@ -87,11 +99,21 @@ pub fn pdu_ids_near_ts(
 		.map_err(|e| err!(Request(NotFound("Room not found: {e:?}"))))
 		.map_ok(move |shortroomid| {
 			match dir {
-				| Forward => Left(self.db.roomid_ts_pducount.stream_from(&key)),
-				| Backward => Right(self.db.roomid_ts_pducount.rev_stream_from(&key)),
+				| Forward => Left(self.db.roomid_tscount_pducount.stream_from(&(
+					room_id,
+					ts,
+					u64::MIN,
+				))),
+				| Backward => Right(self.db.roomid_tscount_pducount.rev_stream_from(&(
+					room_id,
+					ts,
+					u64::MAX,
+				))),
 			}
-			.ready_try_take_while(move |((room_id_, _), _): &KeyVal<'_>| Ok(room_id == *room_id_))
-			.map_ok(move |((_, ts), count)| {
+			.ready_try_take_while(
+				move |((room_id_, ..), _): &KeyVal<'_>| Ok(room_id == *room_id_),
+			)
+			.map_ok(move |((_, ts, _), count)| {
 				(MilliSecondsSinceUnixEpoch(ts), PduId { shortroomid, count: count.into() })
 			})
 		})
@@ -183,10 +205,7 @@ fn each_pdu(
 	(pdu_id, mut pdu): (RawPduId, PduEvent),
 	user_id: Option<&UserId>,
 ) -> Result<PdusIterItem> {
-	if Some(pdu.sender.borrow()) != user_id {
-		pdu.remove_transaction_id().log_err().ok();
-	}
-
+	pdu.remove_transaction_id_unless_sender(user_id);
 	pdu.add_age().log_err().ok();
 
 	Ok((pdu_id.pdu_count(), pdu))

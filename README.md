@@ -6,6 +6,7 @@
 ![Docker Pulls](https://img.shields.io/docker/pulls/jevolk/tuwunel?style=flat%2Dsquare&color=8A2BE2)
 ![GitHub Repo Stars](https://img.shields.io/github/stars/matrix-construct/tuwunel?style=flat%2Dsquare&link=https%3A%2F%2Fgithub.com%2Fmatrix-construct%2Ftuwunel&color=%238A2BE2)
 [![CI/CD](https://github.com/matrix-construct/tuwunel/actions/workflows/main.yml/badge.svg?branch=main&style=flat%2Dsquare)](https://github.com/matrix-construct/tuwunel/actions/workflows/main.yml)
+[![Copr build status](https://copr.fedorainfracloud.org/coprs/trapacid/tuwunel/package/tuwunel/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/trapacid/tuwunel/package/tuwunel/)
 
 <!-- ANCHOR: catchphrase -->
 
@@ -39,9 +40,12 @@ Switzerland 🇨🇭 where it is currently deployed for citizens.
 - [GHCR](https://github.com/matrix-construct/tuwunel/pkgs/container/tuwunel) or `docker pull ghcr.io/matrix-construct/tuwunel:latest`
 - Static binaries available as [releases](https://github.com/matrix-construct/tuwunel/releases) or [build artifacts](https://github.com/matrix-construct/tuwunel/actions?query=branch%3Amain).
 - Deb and RPM packages available as [releases](https://github.com/matrix-construct/tuwunel/releases) or [build artifacts](https://github.com/matrix-construct/tuwunel/actions?query=branch%3Amain).
+- Apt repository available for Debian and Ubuntu, see the [Debian guide](https://matrix-construct.github.io/tuwunel/deploying/debian.html) for setup.
+- [COPR repository](https://copr.fedorainfracloud.org/coprs/trapacid/tuwunel/) available for Fedora, RHEL and other rpm distros, see the [Red Hat guide](https://matrix-construct.github.io/tuwunel/deploying/redhat.html) for setup.
 - Arch package available as [tuwunel](https://aur.archlinux.org/packages/tuwunel).
 - Nix package available as [`matrix-tuwunel`](https://search.nixos.org/packages?query=matrix-tuwunel) and NixOS module available as [`services.matrix-tuwunel`](https://search.nixos.org/options?query=services.matrix-tuwunel).
 - Alpine package available as [tuwunel](https://pkgs.alpinelinux.org/package/edge/testing/x86_64/tuwunel).
+- Gentoo ebuild available in Guru as [net-im/tuwunel](https://gitweb.gentoo.org/repo/proj/guru.git/tree/net-im/tuwunel).
 - Ansible playbook available as [matrix-docker-ansible-deploy](https://github.com/spantaleev/matrix-docker-ansible-deploy/blob/master/docs/configuring-playbook-tuwunel.md).
 
 **1.** [Configure](https://matrix-construct.github.io/tuwunel/configuration.html) by
@@ -86,13 +90,15 @@ granted server admin.
 | Can I migrate from | |
 |-----------------|-----------|
 | conduwuit? | ✅ Yes. This will be supported at a minimum for one year, but likely indefinitely. |
+| A fork of conduwuit? | ✅ Yes. The database migrates in place on first boot. |
+| Conduit? | ✅ Yes. The RocksDB database migrates in place on first boot. |
 | Synapse? | ❌ Not yet, but this is planned and an important issue. Subscribe to [#2](https://github.com/matrix-construct/tuwunel/issues/2). |
-| Conduit? | ❌ Not right now, but this is planned for the near future. Subscribe to [#41](https://github.com/matrix-construct/tuwunel/issues/41). |
-| Any other fork of Conduit? | ❌ No. The migration must be explicitly listed in this table. |
+| Any other Conduit fork? | ❌ No. The migration must be explicitly listed in this table. |
 > [!CAUTION]
-> **Never switch between different forks of Conduit or you will corrupt your database.**
-> All derivatives of Conduit share the same linear database version without any awareness of other
-> forks. The database will permanently corrupt and we will not be able to help you.
+> **Always back up your database before migrating.** Migrating into Tuwunel from a source listed
+> above is safe: Tuwunel recognizes a foreign database and reconciles its schema version on first
+> boot. Switching a database between two other forks of Conduit can still permanently corrupt it,
+> because all derivatives share one linear database version with no awareness of each other.
 
 #### Migrating from conduwuit
 
@@ -106,6 +112,14 @@ noticed that various configs, yamls, services, users, and other items were renam
 were a conduwuit user we recommend against changing anything at all. This will keep things simple.
 If you are not sure please ask. If you found out that something did in fact need to be changed
 please open an issue immediately.
+
+#### Migrating from Conduit or a fork of conduwuit
+
+A RocksDB database from Conduit or a fork of conduwuit migrates in place on first boot. Stop the
+source server, back up its data directory and media, then start Tuwunel against it. Tuwunel
+recognizes the foreign database, reconciles its schema version, and carries over room history,
+account data, and media automatically; no flags are required. See the
+[deploying guide](docs/deploying.md) for media-layout notes that apply to older Conduit databases.
 
 
 ### Upgrading & Downgrading Tuwunel
@@ -133,8 +147,9 @@ for these tags are on average monthly, weekly and daily, respectively.
 
 ### Getting Help & Support
 
-If you are opposed to using github, or if private discussion is required such as for security
-disclosures, or for any other reason, I would be happy to receive your DM at
+Security vulnerabilities have their own reporting process; please see
+[SECURITY.md](./SECURITY.md). If you are opposed to using github, or if private discussion is
+required for any other reason, I would be happy to receive your DM at
 [@jason:tuwunel.me](https://matrix.to/#/@jason:tuwunel.me). This will not be bothering me as it would
 be my pleasure to help you when possible. As an emergency contact you can send an email to
 jasonzemos@gmail.com.

@@ -17,6 +17,7 @@ ARG CARGO_TERM_VERBOSE=0
 ARG RUST_BACKTRACE
 ARG JEMALLOC_OVERRIDE
 ARG ROCKSDB_LIB_DIR
+ARG ROCKSDB_INCLUDE_DIR
 ARG RUSTDOCFLAGS
 ARG CARGO_BUILD_RUSTFLAGS
 ARG CARGO_PROFILE_TEST_DEBUG
@@ -31,6 +32,9 @@ ARG cargo_features
 ARG cargo_spec_features
 ARG cargo_cmd="chef cook --all-targets --no-build"
 ARG color_args="--color always"
+ARG cargo_flags=""
+ARG sched_policy="--batch"
+ARG sched_prio=0
 
 WORKDIR /
 COPY --link --from=rust ${RUST_HOME} ${RUST_HOME}
@@ -46,6 +50,15 @@ ENV CARGO_TERM_VERBOSE="${CARGO_TERM_VERBOSE}"
 ENV RUST_BACKTRACE="${RUST_BACKTRACE}"
 ENV JEMALLOC_OVERRIDE="${JEMALLOC_OVERRIDE}"
 ENV ROCKSDB_LIB_DIR="${ROCKSDB_LIB_DIR}"
+ENV ROCKSDB_INCLUDE_DIR="${ROCKSDB_INCLUDE_DIR}"
+# Link the C++ stdlib via bake's static_libs/dynamic_libs, not the rust-rocksdb
+# System backend. Its build script emits a dynamic `dylib=stdc++`; in the fully
+# static (crt-static) Test/Bench build that leaves dynamic relocations against
+# libstdc++ vtable symbols (e.g. __cxa_pure_virtual) in a binary with no dynamic
+# loader, so glibc aborts at startup ("Unexpected reloc type in static binary",
+# before main). An empty CXXSTDLIB suppresses that directive. Must match the
+# cargo stage's value or the build script re-emits it (rerun-if-env-changed).
+ENV CXXSTDLIB=""
 ENV RUSTDOCFLAGS="${RUSTDOCFLAGS}"
 ENV CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG}"
 ENV CARGO_PROFILE_TEST_INCREMENTAL="${CARGO_PROFILE_TEST_INCREMENTAL}"
@@ -56,6 +69,8 @@ ENV CARGO_PROFILE_RELEASE_DEBUGINFO_DEBUG="${CARGO_PROFILE_RELEASE_DEBUGINFO_DEB
 ENV CARGO_PROFILE_RELEASE_DEBUGINFO_LTO="${CARGO_PROFILE_RELEASE_DEBUGINFO_LTO}"
 ENV CARGO_BUILD_RUSTFLAGS="${CARGO_BUILD_RUSTFLAGS}"
 ENV CARGO_TARGET_DIR="${CARGO_TARGET_DIR}"
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
 RUN \
 --mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
@@ -64,7 +79,7 @@ RUN \
     set -eux
     ulimit -n 65535
 
-    rustup run "${rust_toolchain}" \
+    rustup run "${rust_toolchain}" sched_wrap.sh \
         cargo ${cargo_cmd} \
             --verbose \
             --locked \
@@ -75,7 +90,8 @@ RUN \
             "--target=${CARGO_TARGET}" \
             "--target-dir=${CARGO_TARGET_DIR}" \
             --recipe-path=recipe.json \
-            ${color_args}
+            ${color_args} \
+            ${cargo_flags}
 EOF
 
 
@@ -83,7 +99,11 @@ EOF
 #
 # COPY --from=source merges into /usr/src/tuwunel: real Cargo.toml and
 # src/<member>/src/* overwrite the chef stubs; target/ from cook is
-# preserved (source has no target/ enforced by .dockerignore).
+# preserved (the source-rust allowlist carries no target/).
+#
+# cargo_target_prune trims the target complex from the result layer when
+# nothing downstream consumes it: "all" removes it outright (check, clippy);
+# "bins" keeps only the built binaries for the install and packaging stages.
 FROM input AS cargo
 ARG rust_toolchain
 ARG RUSTUP_HOME
@@ -91,21 +111,34 @@ ARG CARGO_HOME
 ARG CARGO_TARGET
 ARG CARGO_TARGET_DIR
 ARG cargo_profile
+ARG cargo_target_profile
+ARG cargo_target_prune=""
 ARG cargo_features
 ARG cargo_spec_features
 ARG cargo_cmd="build"
 ARG cargo_args=""
 ARG color_args="--color always"
+ARG cargo_flags=""
 ARG VALGRINDFLAGS=""
-ARG VALGRIND_MAX_WORKERS=128
+ARG VALGRIND_MAX_WORKERS=64
+ARG ROCKSDB_PARALLELISM_THREADS=2
+ARG sched_policy="--batch"
+ARG sched_prio=0
 
 WORKDIR /
 COPY --link --from=source /usr/src/tuwunel /usr/src/tuwunel
 
 WORKDIR /usr/src/tuwunel
 SHELL ["/bin/bash", "-c"]
+# Keep in sync with the cook stage: an empty CXXSTDLIB stops the rust-rocksdb
+# System backend emitting a dynamic `dylib=stdc++` (bake links the stdlib itself).
+# A mismatch with cook would re-run the build script and reintroduce the directive.
+ENV CXXSTDLIB=""
 ENV VALGRINDFLAGS="${VALGRINDFLAGS}"
 ENV TUWUNEL_DB_POOL_MAX_WORKERS="${VALGRIND_MAX_WORKERS}"
+ENV TUWUNEL_ROCKSDB_PARALLELISM_THREADS="${ROCKSDB_PARALLELISM_THREADS}"
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
 RUN \
 --mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
@@ -116,7 +149,7 @@ RUN \
 
     example_sha=$(sha1sum tuwunel-example.toml)
 
-    rustup run "${rust_toolchain}" \
+    rustup run "${rust_toolchain}" sched_wrap.sh \
         cargo ${cargo_cmd} \
             --verbose \
             --locked \
@@ -128,10 +161,27 @@ RUN \
             "--target-dir=${CARGO_TARGET_DIR}" \
             "--manifest-path=Cargo.toml" \
             ${color_args} \
+            ${cargo_flags} \
             ${cargo_args}
 
     if ! echo "$example_sha" | sha1sum --check --status; then
         echo "tuwunel-example.toml drift: run cargo check yourself and commit the result." >&2
         exit 1
     fi
+
+    case "${cargo_target_prune}" in
+    all)
+        rm -rf "${CARGO_TARGET_DIR}"
+        ;;
+    bins)
+        dir="${CARGO_TARGET_DIR}/${CARGO_TARGET}/${cargo_target_profile}"
+        rm -rf \
+            "${dir}/deps" \
+            "${dir}/build" \
+            "${dir}/.fingerprint" \
+            "${dir}/incremental" \
+            "${dir}/examples" \
+            "${CARGO_TARGET_DIR}/${cargo_target_profile}"
+        ;;
+    esac
 EOF

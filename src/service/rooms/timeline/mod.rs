@@ -3,6 +3,7 @@ mod backfill;
 mod build;
 mod create;
 mod pdus;
+mod purge;
 mod redact;
 
 use std::{fmt::Write, sync::Arc};
@@ -37,12 +38,16 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Database, Deserialized, Json, Map};
 
-pub use self::pdus::PdusIterItem;
+pub use self::pdus::{PdusIterItem, bias_count};
 use crate::rooms::short::{ShortRoomId, ShortStateHash};
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
+	/// Serializes timeline insertion as the leaf per-room operation.
+	///
+	/// Acquire it after any federation or state mutex held for the same room.
+	/// Never acquire either outer mutex while holding this guard.
 	pub mutex_insert: RoomMutexMap,
 }
 
@@ -50,7 +55,7 @@ struct Data {
 	eventid_outlierpdu: Arc<Map>,
 	eventid_pduid: Arc<Map>,
 	pduid_pdu: Arc<Map>,
-	roomid_ts_pducount: Arc<Map>,
+	roomid_tscount_pducount: Arc<Map>,
 	db: Arc<Database>,
 }
 
@@ -88,7 +93,7 @@ impl crate::Service for Service {
 				eventid_outlierpdu: args.db["eventid_outlierpdu"].clone(),
 				eventid_pduid: args.db["eventid_pduid"].clone(),
 				pduid_pdu: args.db["pduid_pdu"].clone(),
-				roomid_ts_pducount: args.db["roomid_ts_pducount"].clone(),
+				roomid_tscount_pducount: args.db["roomid_tscount_pducount"].clone(),
 				db: args.db.clone(),
 			},
 			mutex_insert: RoomMutexMap::new(),
@@ -97,7 +102,7 @@ impl crate::Service for Service {
 
 	async fn memory_usage(&self, out: &mut (dyn Write + Send)) -> Result {
 		let mutex_insert = self.mutex_insert.len();
-		writeln!(out, "insert_mutex: {mutex_insert}")?;
+		writeln!(out, "- insert_mutex: {mutex_insert}")?;
 
 		Ok(())
 	}
@@ -541,6 +546,17 @@ pub async fn pdu_exists<'a>(&'a self, event_id: &'a EventId) -> bool {
 		.await
 		.map(at!(0))
 		.is_ok()
+}
+
+/// Resolves once `event_id` lands in the timeline (its `eventid_pduid` row is
+/// written), waking a task waiting for the event to arrive via concurrent
+/// ingest. Registration is eager: the watcher is in place when this returns,
+/// before the future is awaited.
+#[implement(Service)]
+pub fn watch_event<'a>(&'a self, event_id: &EventId) -> impl Future<Output = ()> + Send + 'a {
+	self.db
+		.eventid_pduid
+		.watch_raw_prefix_once(event_id)
 }
 
 /// Like get_non_outlier_pdu(), but without the expense of fetching and

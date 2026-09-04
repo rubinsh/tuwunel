@@ -1,4 +1,7 @@
-mod commands;
+mod list;
+mod register;
+mod show_config;
+mod unregister;
 
 use clap::Subcommand;
 use tuwunel_core::Result;

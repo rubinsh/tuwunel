@@ -81,7 +81,7 @@ pub(crate) async fn get_dehydrated_device_route(
 	})
 }
 
-/// # `GET /_matrix/client/../dehydrated_device/{device_id}/events`
+/// # `POST /_matrix/client/../dehydrated_device/{device_id}/events`
 ///
 /// Paginates the events of the dehydrated device.
 #[tracing::instrument(skip_all, fields(%client))]

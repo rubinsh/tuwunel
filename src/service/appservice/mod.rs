@@ -1,21 +1,30 @@
 mod append;
+mod keys;
 mod namespace_regex;
+mod ping;
 mod registration_info;
 pub(crate) mod request;
+mod thirdparty;
 
-use std::{collections::BTreeMap, ffi::OsStr, fs, iter::IntoIterator, sync::Arc};
+use std::{
+	collections::BTreeMap,
+	ffi::OsStr,
+	fs::{self, read_dir},
+	sync::Arc,
+};
 
 use async_trait::async_trait;
-use futures::{Future, FutureExt, Stream, TryStreamExt};
+use futures::{FutureExt, Stream, TryStreamExt};
 use ruma::{RoomAliasId, RoomId, UserId, api::appservice::Registration};
-use tokio::sync::{RwLock, RwLockReadGuard};
-use tuwunel_core::{Err, Result, err, utils::stream::IterStream};
+use tokio::sync::{RwLock, RwLockReadGuard, SetOnce};
+use tuwunel_core::{Err, Result, defer, err, utils::stream::IterStream};
 use tuwunel_database::Map;
 
 pub use self::{namespace_regex::NamespaceRegex, registration_info::RegistrationInfo};
 
 pub struct Service {
 	registration_info: RwLock<Registrations>,
+	loaded: SetOnce<()>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
 }
@@ -31,6 +40,7 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			registration_info: RwLock::new(BTreeMap::new()),
+			loaded: SetOnce::new(),
 			services: args.services.clone(),
 			db: Data {
 				id_appserviceregistrations: args.db["id_appserviceregistrations"].clone(),
@@ -39,6 +49,22 @@ impl crate::Service for Service {
 	}
 
 	async fn worker(self: Arc<Self>) -> Result {
+		defer! {{
+			self.loaded.set(()).ok();
+		}}
+
+		self.load().await
+	}
+
+	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
+}
+
+impl Service {
+	/// Loads every registration source into the runtime registry.
+	///
+	/// The configured `appservice` table is read first, then any YAML under
+	/// `appservice_dir`, then the registrations persisted by the admin command.
+	async fn load(&self) -> Result {
 		for (id, mut appservice) in self.services.config.appservice.clone() {
 			if appservice.id.is_empty() {
 				appservice.id = id.clone();
@@ -56,7 +82,11 @@ impl crate::Service for Service {
 		}
 
 		if let Some(appservice_dir) = &self.services.config.appservice_dir {
-			for dir_entry in fs::read_dir(appservice_dir)? {
+			let entries = read_dir(appservice_dir).map_err(|e| {
+				err!(Config("appservice_dir", "Failed to read {appservice_dir:?}: {e}"))
+			})?;
+
+			for dir_entry in entries {
 				let path = dir_entry?.path();
 
 				if !path.is_file()
@@ -82,10 +112,6 @@ impl crate::Service for Service {
 		Ok(())
 	}
 
-	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
-}
-
-impl Service {
 	pub async fn load_appservice(&self, registration: Registration) -> Result {
 		//TODO: Check for collisions between exclusive appservice namespaces
 
@@ -125,6 +151,8 @@ impl Service {
 	}
 
 	pub async fn register_appservice(&self, registration: Registration) -> Result {
+		self.loaded().await;
+
 		let id = registration.id.clone();
 
 		let appservice_yaml = serde_yaml::to_string(&registration)?;
@@ -139,6 +167,8 @@ impl Service {
 	}
 
 	pub async fn unregister_appservice(&self, appservice_id: &str) -> Result {
+		self.loaded().await;
+
 		let mut registrations = self.registration_info.write().await;
 
 		if !registrations.contains_key(appservice_id) {
@@ -182,6 +212,16 @@ impl Service {
 			.map(|info| info.registration)
 	}
 
+	/// Retrieve a registration with its compiled namespaces (`sender`,
+	/// `is_user_match`), which a bare `Registration` lacks.
+	pub async fn get_registration_info(&self, id: &str) -> Option<RegistrationInfo> {
+		self.registration_info
+			.read()
+			.await
+			.get(id)
+			.cloned()
+	}
+
 	pub async fn find_from_access_token(&self, token: &str) -> Result<RegistrationInfo> {
 		self.read()
 			.await
@@ -197,6 +237,14 @@ impl Service {
 			.await
 			.values()
 			.any(|info| info.is_exclusive_user_match(user_id))
+	}
+
+	/// Checks if a given user id matches any appservice's user namespace.
+	pub async fn is_interested_in_user(&self, user_id: &UserId) -> bool {
+		self.read()
+			.await
+			.values()
+			.any(|info| info.is_user_match(user_id))
 	}
 
 	/// Checks if a given room alias matches any exclusive appservice regex
@@ -244,4 +292,12 @@ impl Service {
 	pub fn read(&self) -> impl Future<Output = RwLockReadGuard<'_, Registrations>> + Send {
 		self.registration_info.read()
 	}
+
+	/// Waits for the boot-time registration load to finish.
+	///
+	/// The latch is released on every exit from the worker, a failed or
+	/// panicking load included, so a waiter is never stranded on a load that
+	/// will not complete.
+	#[inline]
+	pub async fn loaded(&self) { self.loaded.wait().await; }
 }

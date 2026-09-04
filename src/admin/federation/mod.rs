@@ -1,4 +1,8 @@
-mod commands;
+mod disable_room;
+mod enable_room;
+mod fetch_support_well_known;
+mod incoming_federation;
+mod remote_user_in_rooms;
 
 use clap::Subcommand;
 use ruma::{OwnedRoomId, OwnedServerName, OwnedUserId};

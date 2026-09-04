@@ -109,7 +109,48 @@ keys:
 > to `true` if you have that specific topology. If calls fail only for clients
 > on the same LAN as the server, see the Troubleshooting section.
 
+The `use_external_ip` option above makes Livekit discover the server's
+public IP via STUN and advertise it to clients. This suits a host whose
+public IP is not bound to a local network interface, such as a cloud VM
+behind 1:1 NAT (AWS, GCP) or a server behind a router.
+
+If the public IP is bound directly to a network interface, which is
+typical for a VPS (Hetzner, OVH, netcup, and similar), prefer setting
+the address explicitly. Replace `use_external_ip: true` with the
+following, where `EXTERNAL_IP` is the server's public IP:
+
+```yaml
+rtc:
+  # ...
+  use_external_ip: false
+  node_ip: "EXTERNAL_IP"
+```
+
+This matters because Livekit, running with host networking, gathers
+candidate addresses from every interface on the host, including the
+Docker bridge gateways (`docker0` and per-network `br-*` addresses,
+typically `172.17.x.x` and up). These cannot be reached from outside,
+but with `use_external_ip: true` they are still advertised to clients
+as ICE host candidates, which can delay or prevent calls from
+connecting. Setting `node_ip` advertises only the given address; note
+that it only takes effect while `use_external_ip` is `false`. The
+built-in TURN server (described further below) also allocates its relay
+addresses at the node IP.
+
+If your server is behind NAT with a dynamic public address, keep
+`use_external_ip: true` and add `external_ip_only: true` to the `rtc`
+block to suppress the bridge addresses instead.
+
 ## 3. Configure .well-known
+
+Clients discover MatrixRTC through two surfaces, and Tuwunel serves
+both: the `org.matrix.msc4143.rtc_foci` key in
+`.well-known/matrix/client`, and the client API endpoint
+`GET /_matrix/client/unstable/org.matrix.msc4143/rtc/transports` that
+Element Call and Element X query. That endpoint is answered from
+`tuwunel.toml` alone, never from a `.well-known` file another server
+hosts, so `livekit_url` belongs in your Tuwunel configuration either
+way.
 
 ### 3.1. .well-known served by Tuwunel
 
@@ -159,6 +200,14 @@ The final file should look something like this:
   ]
 }
 ```
+
+> [!NOTE]
+> Serving `.well-known` yourself covers only one of the two discovery
+> surfaces. Set `livekit_url` in your `tuwunel.toml` as well, exactly as
+> in Step 3.1, so the `rtc/transports` endpoint advertises the same
+> focus. Without it that endpoint answers with an empty list and clients
+> report that the server has no MatrixRTC transport, even though your
+> `.well-known` is correct.
 
 ## 4. Configure Firewall
 
@@ -288,7 +337,7 @@ services:
     labels:
         - "traefik.enable=true"
         - "traefik.http.routers.matrixrtcjwt.entrypoints=websecure"
-        - "traefik.http.routers.matrixrtcjwt.rule=Host(`matrix-rtc.yourdomain.com`) && PathPrefix(`/sfu/get`) || PathPrefix(`/healthz`)"
+        - "traefik.http.routers.matrixrtcjwt.rule=Host(`matrix-rtc.yourdomain.com`) && (PathPrefix(`/sfu/get`) || PathPrefix(`/healthz`) || PathPrefix(`/get_token`))"
         - "traefik.http.routers.matrixrtcjwt.tls=true"
         - "traefik.http.routers.matrixrtcjwt.service=matrixrtcjwt"
         - "traefik.http.services.matrixrtcjwt.loadbalancer.server.port=8081"
@@ -316,7 +365,7 @@ http:
         matrixrtcjwt:
             entryPoints:
                 - "websecure"
-            rule: "Host(`matrix-rtc.yourdomain.com`) && PathPrefix(`/sfu/get`) || PathPrefix(`/healthz`)"
+            rule: "Host(`matrix-rtc.yourdomain.com`) && (PathPrefix(`/sfu/get`) || PathPrefix(`/healthz`) || PathPrefix(`/get_token`))"
             tls:
                 certResolver: "yourcertresolver" # change to your cert resolver's name
             service: matrixrtcjwt
@@ -402,7 +451,7 @@ to improve call reliability. As Coturn allows multiple instances of
 `static-auth-secret`, it is suggested that the secret used for Livekit is
 different to that used for Tuwunel.
 
-1. Create a secret for Coturn — a random 64-character alphanumeric string is
+1. Create a secret for Coturn; a random 64-character alphanumeric string is
    suggested.
 2. Add the following line to the end of your `coturn.conf`, where
    `AUTH_SECRET` is the secret created in Step 1:
@@ -429,6 +478,10 @@ Livekit includes a built-in TURN server which can be used in place of an
 external option. This TURN server will only work with Livekit and is not
 compatible with traditional Matrix calling. For that, see the
 [TURN documentation](turn.md).
+
+The TURN server allocates relay addresses at the node IP, so the
+`use_external_ip` and `node_ip` guidance in step 2.2 applies here as
+well; if Livekit runs in Docker and TURN fails, revisit that step.
 
 #### Basic Setup
 
@@ -562,3 +615,33 @@ rewrite", or "host override" setting. Alternatively, run a small local
 DNS resolver (dnsmasq, AdGuard Home, Pi-hole) on the network and point
 LAN clients at it. External clients continue to resolve the subdomain
 to the public IP via public DNS.
+
+### Clients report that the server has no MatrixRTC transport
+
+Element X and Element Call read the server's transports from
+`GET /_matrix/client/unstable/org.matrix.msc4143/rtc/transports`, which
+Tuwunel builds from `livekit_url` and
+`[[global.well_known.rtc_transports]]` in `tuwunel.toml`. With neither
+set, the endpoint answers with an empty list and those clients report
+that no transport is available, even when `.well-known/matrix/client`
+carries a correct `org.matrix.msc4143.rtc_foci` key. This is the usual
+cause when something other than Tuwunel serves your `.well-known`.
+
+Check it directly (no access token is needed as of v1.8.2):
+
+```bash
+curl -s https://matrix.yourdomain.com/_matrix/client/unstable/org.matrix.msc4143/rtc/transports
+```
+
+An empty `rtc_transports` array means `livekit_url` is unset. Add it per
+step 3.1 and restart Tuwunel.
+
+### Docker bridge addresses advertised as candidates
+
+With host networking, Livekit gathers candidate addresses from every
+interface on the host, including Docker bridge gateways (`docker0` and
+per-network `br-*` addresses, typically `172.17.x.x` and up). If calls
+fail to connect and the Livekit container log shows bridge addresses in
+its `using external IPs` line, clients are being offered unreachable
+candidates. See step 2.2 for the `node_ip` and `external_ip_only`
+settings that suppress them.

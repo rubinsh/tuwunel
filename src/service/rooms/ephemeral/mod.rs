@@ -35,7 +35,7 @@ use std::{
 use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId, serde::Raw};
 use serde_json::value::RawValue as RawJsonValue;
 use tokio::sync::{RwLock, broadcast};
-use tuwunel_core::{Result, Server, debug_info, trace, utils};
+use tuwunel_core::{Result, debug_info, trace, utils};
 
 const MAX_ENTRIES_PER_ROOM: usize = 1024;
 
@@ -49,8 +49,6 @@ pub struct EphemeralEntry {
 }
 
 pub struct Service {
-	#[allow(dead_code)]
-	server: Arc<Server>,
 	services: Arc<crate::services::OnceServices>,
 	/// Per-room bounded ring of ephemeral entries, ordered by counter
 	/// (oldest first). Eviction happens on push; readers slice by
@@ -62,7 +60,6 @@ pub struct Service {
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
-			server: args.server.clone(),
 			services: args.services.clone(),
 			entries: RwLock::new(BTreeMap::new()),
 			update_sender: broadcast::channel(100).0,
@@ -93,13 +90,16 @@ impl Service {
 			origin_server_ts: utils::millis_since_unix_epoch(),
 			content,
 		};
-		drop(counter);
 
-		{
-			let mut map = self.entries.write().await;
-			let ring = map.entry(room_id.to_owned()).or_default();
-			push_with_eviction(ring, entry);
-		}
+		let mut map = self.entries.write().await;
+		let ring = map.entry(room_id.to_owned()).or_default();
+		push_with_eviction(ring, entry);
+		drop(map);
+
+		// `next_batch` waits for dispatched counters to retire. Keep the permit
+		// until the entry is visible so /sync cannot advance past an in-flight PUT.
+		// See `core/utils/two_phase_counter.rs`; rooms/typing uses the same order.
+		drop(counter);
 
 		if self
 			.update_sender
@@ -110,19 +110,6 @@ impl Service {
 		}
 
 		Ok(())
-	}
-
-	/// Maximum counter currently stored for `room_id`, or 0 if none.
-	/// /sync compares against the request's `since` to decide whether
-	/// it has anything to emit.
-	pub async fn last_update(&self, room_id: &RoomId) -> u64 {
-		self.entries
-			.read()
-			.await
-			.get(room_id)
-			.and_then(|ring| ring.back())
-			.map(|e| e.counter)
-			.unwrap_or(0)
 	}
 
 	/// Snapshot of entries in `room_id` with `since < counter <=

@@ -2,6 +2,7 @@ mod account_data;
 mod appservice;
 mod globals;
 mod oauth;
+mod peer_status;
 mod presence;
 mod pusher;
 mod raw;
@@ -13,6 +14,7 @@ mod sending;
 mod short;
 mod storage;
 mod sync;
+mod threepid;
 mod users;
 
 use clap::Subcommand;
@@ -20,11 +22,11 @@ use tuwunel_core::Result;
 
 use self::{
 	account_data::AccountDataCommand, appservice::AppserviceCommand, globals::GlobalsCommand,
-	oauth::OauthCommand, presence::PresenceCommand, pusher::PusherCommand, raw::RawCommand,
-	resolver::ResolverCommand, room_alias::RoomAliasCommand,
-	room_state_cache::RoomStateCacheCommand, room_timeline::RoomTimelineCommand,
-	sending::SendingCommand, short::ShortCommand, storage::StorageCommand, sync::SyncCommand,
-	users::UsersCommand,
+	oauth::OauthCommand, peer_status::PeerStatusCommand, presence::PresenceCommand,
+	pusher::PusherCommand, raw::RawCommand, resolver::ResolverCommand,
+	room_alias::RoomAliasCommand, room_state_cache::RoomStateCacheCommand,
+	room_timeline::RoomTimelineCommand, sending::SendingCommand, short::ShortCommand,
+	storage::StorageCommand, sync::SyncCommand, threepid::ThreepidCommand, users::UsersCommand,
 };
 use crate::admin_command_dispatch;
 
@@ -68,9 +70,17 @@ pub(super) enum QueryCommand {
 	#[command(subcommand)]
 	Users(UsersCommand),
 
+	/// - threepid service
+	#[command(subcommand)]
+	Threepid(ThreepidCommand),
+
 	/// - resolver service
 	#[command(subcommand)]
 	Resolver(ResolverCommand),
+
+	/// - per-server reachability store on the federation service
+	#[command(subcommand)]
+	PeerStatus(PeerStatusCommand),
 
 	/// - pusher service
 	#[command(subcommand)]

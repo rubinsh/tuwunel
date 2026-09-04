@@ -4,6 +4,8 @@ use std::{
 };
 
 use futures::{FutureExt, future::join, pin_mut};
+#[cfg(all(feature = "systemd", target_os = "linux"))]
+use sd_notify::{NotifyState, notify, notify_and_unset_env, watchdog_enabled};
 use tuwunel_core::{
 	Error, Result, Server, debug, debug_error, debug_info, error, info, utils::BoolExt,
 };
@@ -17,8 +19,8 @@ pub(crate) async fn run(services: Arc<Services>) -> Result {
 	let server = &services.server;
 	debug!("Start");
 
-	// Install the admin room callback here for now
-	tuwunel_admin::init(&services.admin).await;
+	// Install the admin command root here for now
+	tuwunel_admin::init(&services.admin);
 
 	// Execute configured startup commands.
 	services.admin.startup_execute().await?;
@@ -67,8 +69,8 @@ pub(crate) async fn run(services: Arc<Services>) -> Result {
 	sigs.abort();
 	_ = sigs.await;
 
-	// Remove the admin room callback
-	tuwunel_admin::fini(&services.admin).await;
+	// Remove the admin command root
+	tuwunel_admin::fini(&services.admin);
 
 	debug_info!("Finish");
 	res
@@ -79,10 +81,23 @@ pub(crate) async fn run(services: Arc<Services>) -> Result {
 pub(crate) async fn start(server: Arc<Server>) -> Result<Arc<Services>> {
 	debug!("Starting...");
 
-	let services = Services::build(server).await?.start().await?;
+	#[cfg(all(feature = "systemd", target_os = "linux"))]
+	let keepalive = server.runtime().spawn(extend_systemd_startup());
+
+	let services = async move { Services::build(server).await?.start().await }.await;
 
 	#[cfg(all(feature = "systemd", target_os = "linux"))]
-	sd_notify::notify(false, &[sd_notify::NotifyState::Ready])
+	{
+		keepalive.abort();
+		_ = keepalive.await;
+	};
+
+	let services = services?;
+
+	// The status is set here so it reads as a baseline rather than staying blank
+	// until the first reload replaces it.
+	#[cfg(all(feature = "systemd", target_os = "linux"))]
+	notify(&[NotifyState::Ready, NotifyState::Status("Running")])
 		.expect("failed to notify systemd of ready state");
 
 	debug!("Started");
@@ -95,8 +110,7 @@ pub(crate) async fn stop(services: Arc<Services>) -> Result {
 	debug!("Shutting down...");
 
 	#[cfg(all(feature = "systemd", target_os = "linux"))]
-	sd_notify::notify(true, &[sd_notify::NotifyState::Stopping])
-		.expect("failed to notify systemd of stopping state");
+	notify_systemd_shutdown(&services.server);
 
 	// Wait for all completions before dropping or we'll lose them to the module
 	// unload and explode.
@@ -123,6 +137,28 @@ pub(crate) async fn stop(services: Arc<Services>) -> Result {
 
 	info!("Shutdown complete.");
 	Ok(())
+}
+
+#[cfg(all(feature = "systemd", target_os = "linux"))]
+fn notify_systemd_shutdown(server: &Server) {
+	// An in-place exec restart keeps this PID; report a reload, not an exit, so
+	// the unit stays active and NOTIFY_SOCKET survives for the next image. The
+	// watchdog stays armed while reloading, so reset it to give teardown and
+	// exec the full interval.
+	if server.is_restarting() {
+		let monotonic = NotifyState::monotonic_usec_now().expect("failed to get monotonic time");
+
+		notify(&[NotifyState::Reloading, monotonic, NotifyState::Watchdog])
+			.expect("failed to notify systemd of reloading state");
+
+		return;
+	}
+
+	// SAFETY: clears NOTIFY_SOCKET from the process environment. Safe because no
+	// other thread reads or writes that variable; this matches the previous
+	// `notify(unset_env=true, ...)` semantics from sd-notify 0.4.
+	unsafe { notify_and_unset_env(&[NotifyState::Stopping]) }
+		.expect("failed to notify systemd of stopping state");
 }
 
 #[tracing::instrument(skip_all)]
@@ -164,14 +200,15 @@ fn handle_services_finish(
 }
 
 #[cfg(all(feature = "systemd", target_os = "linux"))]
+#[expect(clippy::infinite_loop)]
 async fn start_systemd_watchdog() {
 	use tokio::time::MissedTickBehavior;
 
-	let mut watchdog_usec = 0;
-	if !sd_notify::watchdog_enabled(false, &mut watchdog_usec) || watchdog_usec == 0 {
+	let Some(watchdog) = watchdog_enabled() else {
 		return;
-	}
+	};
 
+	let watchdog_usec = u64::try_from(watchdog.as_micros()).unwrap_or(u64::MAX);
 	let interval_usec = (watchdog_usec / 2).max(1);
 	let interval = Duration::from_micros(interval_usec);
 
@@ -180,8 +217,38 @@ async fn start_systemd_watchdog() {
 	loop {
 		ticker.tick().await;
 
-		if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]) {
-			error!("failed to notify systemd watchdog state: {e}");
+		if let Err(e) = notify(&[NotifyState::Watchdog]) {
+			error!(%e, "failed to notify systemd watchdog state");
+		}
+	}
+}
+
+#[cfg(all(feature = "systemd", target_os = "linux"))]
+#[expect(clippy::infinite_loop)]
+async fn extend_systemd_startup() {
+	use std::env;
+
+	use tokio::time::MissedTickBehavior;
+
+	const INTERVAL: Duration = Duration::from_secs(15);
+
+	// Keep systemd's start timeout extended while a slow boot such as a database
+	// migration runs, so a healthy service is not killed before it signals ready.
+	if env::var_os("NOTIFY_SOCKET").is_none() {
+		return;
+	}
+
+	let extend_usec = u32::try_from(INTERVAL.as_micros())
+		.unwrap_or(u32::MAX)
+		.saturating_mul(2);
+
+	let mut ticker = tokio::time::interval(INTERVAL);
+	ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+	loop {
+		ticker.tick().await;
+
+		if let Err(e) = notify(&[NotifyState::ExtendTimeoutUsec(extend_usec)]) {
+			error!(%e, "failed to extend systemd startup timeout");
 		}
 	}
 }

@@ -2,6 +2,7 @@ use axum::extract::State;
 use ruma::api::federation::event::get_event_by_timestamp::v1;
 use tuwunel_core::{Err, Result};
 
+use super::AccessCheck;
 use crate::router::Ruma;
 
 /// # `GET /_matrix/federation/v1/timestamp_to_event/{roomId}`
@@ -14,11 +15,14 @@ pub(crate) async fn get_event_by_timestamp_route(
 	let origin = body.origin();
 	let room_id = &body.room_id;
 
-	// check if the server is allowed to see the room
-	services
-		.event_handler
-		.acl_check(origin, room_id)
-		.await?;
+	AccessCheck {
+		services: &services,
+		origin,
+		room_id,
+		event_id: None,
+	}
+	.check()
+	.await?;
 
 	// get the closest event to the timestamp
 	let (origin_server_ts, event_id) = services

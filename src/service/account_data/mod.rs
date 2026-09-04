@@ -1,4 +1,5 @@
 mod direct;
+mod push_rules;
 mod room_tags;
 
 use std::sync::Arc;
@@ -10,15 +11,34 @@ use ruma::{
 		AnyGlobalAccountDataEvent, AnyRawAccountDataEvent, AnyRoomAccountDataEvent,
 		GlobalAccountDataEventType, RoomAccountDataEventType,
 	},
+	push::{RuleKind, Ruleset},
 	serde::Raw,
 };
 use serde::Deserialize;
 use serde_json::json;
 use tuwunel_core::{
 	Err, Result, at, err, implement,
-	utils::{ReadyExt, result::LogErr, stream::TryIgnore},
+	utils::{ReadyExt, TryReadyExt, result::LogErr, stream::TryIgnore},
 };
 use tuwunel_database::{Deserialized, Handle, Ignore, Interfix, Json, Map};
+
+/// Maximum number of push rules one account may hold.
+///
+/// The ruleset is a single account-data blob rewritten in full on every
+/// mutation and matched against every event for every local recipient, so the
+/// count bounds the write cost and the per-event matching work alike.
+pub const MAX_RULES: usize = 10_000;
+
+/// Longest rule ID stored, in bytes.
+///
+/// Room IDs reach 255 bytes and are routinely used as rule IDs, so the ceiling
+/// sits above that rather than at it.
+pub const MAX_RULE_ID_BYTES: usize = 300;
+
+/// Largest match and action data stored for one rule, in bytes.
+///
+/// Rule IDs are excluded and bounded separately by [`MAX_RULE_ID_BYTES`].
+pub const MAX_RULE_BYTES: usize = 1024;
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -44,6 +64,19 @@ impl crate::Service for Service {
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
 
+/// Whether a ruleset has room for the rule with the given kind and ID.
+///
+/// A rule replacing one already present adds nothing, so only an unseen ID is
+/// held against [`MAX_RULES`]. The ID is bounded here rather than at each call
+/// site because a room ID serves as the rule ID for room rules and carries no
+/// length of its own once arbitrary-length identifiers are accepted.
+#[must_use]
+pub fn admits_rule(ruleset: &Ruleset, kind: RuleKind, rule_id: &str) -> bool {
+	rule_id.len() <= MAX_RULE_ID_BYTES
+		&& (ruleset.get(kind, rule_id).is_some()
+			|| ruleset.iter().take(MAX_RULES).count() < MAX_RULES)
+}
+
 /// Places one event in the account data of the user and removes the
 /// previous entry.
 #[implement(Service)]
@@ -60,10 +93,6 @@ pub async fn update(
 
 	let count = self.services.globals.next_count();
 	let roomuserdataid = (room_id, user_id, *count, &event_type);
-	self.db
-		.roomuserdataid_accountdata
-		.put(roomuserdataid, Json(data));
-
 	let key = (room_id, user_id, &event_type);
 	let prev = self
 		.db
@@ -71,14 +100,16 @@ pub async fn update(
 		.qry(&key)
 		.await;
 
-	self.db
-		.roomusertype_roomuserdataid
-		.put(key, roomuserdataid);
+	let mut txn = self.services.db.txn();
 
-	// Remove old entry
+	txn.put(&self.db.roomuserdataid_accountdata, roomuserdataid, Json(data));
+	txn.put(&self.db.roomusertype_roomuserdataid, key, roomuserdataid);
+
 	if let Ok(prev) = prev {
-		self.db.roomuserdataid_accountdata.remove(&prev);
+		txn.del_raw(&self.db.roomuserdataid_accountdata, prev);
 	}
+
+	txn.execute();
 
 	Ok(())
 }
@@ -157,6 +188,24 @@ pub fn changes_since<'a>(
 	since: u64,
 	to: Option<u64>,
 ) -> impl Stream<Item = AnyRawAccountDataEvent> + Send + 'a {
+	self.changes_since_fallible(room_id, user_id, since, to)
+		.map(LogErr::log_err)
+		.ignore_err()
+}
+
+/// Returns bounded account-data changes without suppressing failures.
+///
+/// The lower bound is exclusive and the optional upper bound is inclusive.
+/// Cursor, decode, and deserialization failures remain in the stream for an
+/// atomic caller to handle.
+#[implement(Service)]
+pub fn changes_since_fallible<'a>(
+	&'a self,
+	room_id: Option<&'a RoomId>,
+	user_id: &'a UserId,
+	since: u64,
+	to: Option<u64>,
+) -> impl Stream<Item = Result<AnyRawAccountDataEvent>> + Send + 'a {
 	type Key<'a> = (Option<&'a RoomId>, &'a UserId, u64, Ignore);
 
 	// Skip the data that's exactly at since, because we sent that last time
@@ -165,11 +214,10 @@ pub fn changes_since<'a>(
 	self.db
 		.roomuserdataid_accountdata
 		.stream_from(&first_possible)
-		.ignore_err()
-		.ready_take_while(move |((room_id_, user_id_, count, _), _): &(Key<'_>, _)| {
-			room_id == *room_id_ && user_id == *user_id_ && to.is_none_or(|to| *count <= to)
+		.ready_try_take_while(move |((room_id_, user_id_, count, _), _): &(Key<'_>, _)| {
+			Ok(room_id == *room_id_ && user_id == *user_id_ && to.is_none_or(|to| *count <= to))
 		})
-		.map(move |(_, v)| {
+		.ready_and_then(move |(_, v)| {
 			match room_id {
 				| Some(_) => serde_json::from_slice::<Raw<AnyRoomAccountDataEvent>>(v)
 					.map(AnyRawAccountDataEvent::Room),
@@ -177,9 +225,7 @@ pub fn changes_since<'a>(
 					.map(AnyRawAccountDataEvent::Global),
 			}
 			.map_err(|e| err!(Database("Database contains invalid account data: {e}")))
-			.log_err()
 		})
-		.ignore_err()
 }
 
 /// MSC4025: erase all account data for a user in the given namespace
@@ -189,20 +235,23 @@ pub fn changes_since<'a>(
 #[implement(Service)]
 pub async fn erase_user(&self, user_id: &UserId, room_id: Option<&RoomId>) {
 	let prefix = (room_id, user_id, Interfix);
+	let mut txn = self.services.db.txn();
 
 	self.db
 		.roomuserdataid_accountdata
 		.keys_prefix_raw(&prefix)
 		.ignore_err()
-		.ready_for_each(|key| self.db.roomuserdataid_accountdata.remove(key))
+		.ready_for_each(|key| txn.del_raw(&self.db.roomuserdataid_accountdata, key))
 		.await;
 
 	self.db
 		.roomusertype_roomuserdataid
 		.keys_prefix_raw(&prefix)
 		.ignore_err()
-		.ready_for_each(|key| self.db.roomusertype_roomuserdataid.remove(key))
+		.ready_for_each(|key| txn.del_raw(&self.db.roomusertype_roomuserdataid, key))
 		.await;
+
+	txn.execute();
 }
 
 /// Returns all changes to the account data that happened after `since`.

@@ -1,6 +1,9 @@
+#![cfg_attr(not(tokio_unstable), expect(unused))]
+
 use std::{
 	cell::OnceCell,
 	iter::once,
+	path::PathBuf,
 	sync::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
@@ -10,13 +13,16 @@ use std::{
 };
 
 use tokio::runtime::Builder;
+#[cfg(tokio_unstable)]
+use tokio::runtime::HistogramConfiguration;
 pub use tokio::runtime::{Handle, Runtime as Tokio};
 #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 use tuwunel_core::result::LogDebugErr;
 use tuwunel_core::{
-	Result, debug, implement, is_true,
-	metrics::Metrics,
+	Result, debug, error, implement, is_true,
+	metrics::{Metrics, dump},
 	utils::sys::{
+		self,
 		compute::{nth_core_available, set_affinity},
 		max_threads,
 	},
@@ -25,11 +31,13 @@ use tuwunel_core::{
 pub struct Runtime {
 	runtime: OnceCell<Tokio>,
 	metrics: Arc<Metrics>,
-	_state: Arc<State>,
+	state: Arc<State>,
 }
 
 #[derive(Default)]
 struct State {
+	metrics_dump: Option<PathBuf>,
+	usage_dump: Option<PathBuf>,
 	worker_affinity: Option<bool>,
 	gc_on_park: Option<bool>,
 	gc_muzzy: Option<bool>,
@@ -58,6 +66,8 @@ pub fn new(args: Option<&crate::Args>) -> Result<Self> {
 		.clamp(WORKER_THREAD_MIN, BLOCKING_THREAD_MAX);
 
 	let state = Arc::new(State {
+		metrics_dump: args.runtime_metrics_dir.clone(),
+		usage_dump: args.runtime_usage_dir.clone(),
 		worker_affinity: Some(args.worker_affinity),
 		gc_on_park: args.gc_on_park,
 		gc_muzzy: args.gc_muzzy,
@@ -78,44 +88,66 @@ pub fn new(args: Option<&crate::Args>) -> Result<Self> {
 	state.enable_hooks(&mut builder);
 
 	#[cfg(tokio_unstable)]
-	enable_histogram(&mut builder, args);
+	enable_poll_histogram(&mut builder, args);
+
+	#[cfg(tokio_unstable)]
+	enable_sched_histogram(&mut builder, args);
 
 	let runtime = builder.build()?;
 
 	Ok(Self {
 		metrics: Metrics::new(runtime.handle().into()),
 		runtime: runtime.into(),
-		_state: state,
+		state,
 	})
 }
 
-#[cfg(not(tokio_unstable))]
-impl Drop for Runtime {
-	#[tracing::instrument(name = "stop", level = "info", skip_all)]
-	fn drop(&mut self) { self.wait_shutdown(); }
-}
-
-#[cfg(tokio_unstable)]
 impl Drop for Runtime {
 	#[tracing::instrument(name = "stop", level = "info", skip_all)]
 	fn drop(&mut self) {
-		use tracing::Level;
-
-		// The final metrics output is promoted to INFO when tokio_unstable is active in
-		// a release/bench mode and DEBUG is likely optimized out
-		const IS_DEBUG: bool = cfg!(not(any(tokio_unstable, feature = "release_max_log_level")));
-
-		const LEVEL: Level = if IS_DEBUG { Level::DEBUG } else { Level::INFO };
-
 		self.wait_shutdown();
 
-		if let Some(runtime_metrics) = self.metrics.runtime_interval() {
-			tuwunel_core::event!(LEVEL, ?runtime_metrics, "Final runtime metrics.");
-		}
+		#[cfg(tokio_unstable)]
+		self.dump_runtime_metrics();
+		self.dump_resource_usage();
+	}
+}
 
-		if let Ok(resource_usage) = tuwunel_core::utils::sys::usage() {
-			tuwunel_core::event!(LEVEL, ?resource_usage, "Final resource usage.");
-		}
+#[cfg(tokio_unstable)]
+#[implement(Runtime)]
+fn dump_runtime_metrics(&self) {
+	use tracing::Level;
+	use tuwunel_core::event;
+
+	// The final metrics output is promoted to INFO when tokio_unstable is active in
+	// a release/bench mode and DEBUG is likely optimized out
+	const IS_DEBUG: bool = cfg!(not(any(tokio_unstable, feature = "release_max_log_level")));
+
+	const LEVEL: Level = if IS_DEBUG { Level::DEBUG } else { Level::INFO };
+
+	let Some(runtime_metrics) = self.metrics.runtime_interval() else {
+		return;
+	};
+
+	event!(LEVEL, ?runtime_metrics, "Final runtime metrics.");
+
+	if let Some(dir) = self.state.metrics_dump.as_deref() {
+		dump::write_runtime_metrics(dir, &runtime_metrics);
+	}
+}
+
+#[implement(Runtime)]
+fn dump_resource_usage(&self) {
+	let Some(dir) = self.state.usage_dump.as_deref() else {
+		return;
+	};
+
+	match sys::usage() {
+		| Ok(usage) => dump::write_resource_usage(dir, &usage),
+		| Err(error) => error!(
+			%error,
+			"Failed to read getrusage at exit."
+		),
 	}
 }
 
@@ -158,16 +190,30 @@ pub fn runtime(&self) -> &Tokio {
 }
 
 #[cfg(tokio_unstable)]
-fn enable_histogram(builder: &mut Builder, args: &crate::Args) {
-	use tokio::runtime::HistogramConfiguration;
-
-	let buckets = args.worker_histogram_buckets;
-	let interval = Duration::from_micros(args.worker_histogram_interval);
-	let linear = HistogramConfiguration::linear(interval, buckets);
+fn enable_poll_histogram(builder: &mut Builder, args: &crate::Args) {
+	let linear =
+		linear_histogram(args.worker_poll_histogram_interval, args.worker_poll_histogram_buckets);
 
 	builder
 		.enable_metrics_poll_time_histogram()
 		.metrics_poll_time_histogram_configuration(linear);
+}
+
+#[cfg(tokio_unstable)]
+fn enable_sched_histogram(builder: &mut Builder, args: &crate::Args) {
+	let linear = linear_histogram(
+		args.worker_sched_histogram_interval,
+		args.worker_sched_histogram_buckets,
+	);
+
+	builder
+		.enable_metrics_schedule_latency_histogram()
+		.metrics_schedule_latency_histogram_configuration(linear);
+}
+
+#[cfg(tokio_unstable)]
+fn linear_histogram(micros: u64, buckets: usize) -> HistogramConfiguration {
+	HistogramConfiguration::linear(Duration::from_micros(micros), buckets)
 }
 
 #[implement(State)]
@@ -294,7 +340,7 @@ fn set_worker_mallctl(&self, _id: usize) {
 #[expect(clippy::unused_self)]
 fn thread_stop(&self) {
 	if cfg!(any(tokio_unstable, not(feature = "release_max_log_level")))
-		&& let Ok(resource_usage) = tuwunel_core::utils::sys::thread_usage()
+		&& let Ok(resource_usage) = sys::thread_usage()
 	{
 		tuwunel_core::debug!(?resource_usage, "Thread resource usage.");
 	}

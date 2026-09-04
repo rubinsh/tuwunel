@@ -29,7 +29,8 @@ pub(crate) use self::{
 	logout::{logout_all_route, logout_route},
 	refresh::refresh_token_route,
 	sso::{
-		sso_callback_route, sso_fallback_route, sso_login_route, sso_login_with_provider_route,
+		sso_callback_route, sso_complete_js_route, sso_css_route, sso_fallback_route,
+		sso_login_route, sso_login_with_provider_route,
 	},
 	token::login_token_route,
 };
@@ -50,44 +51,53 @@ pub(crate) async fn get_login_types_route(
 
 	let list_idps = !services.config.sso_custom_providers_page && !services.config.single_sso;
 
-	let identity_providers: Vec<_> = services
+	let identity_providers: Option<Vec<_>> = list_idps.then(|| {
+		services
+			.config
+			.identity_provider
+			.values()
+			.cloned()
+			.map(|config| IdentityProvider {
+				id: config.id().to_owned(),
+				brand: Some(config.brand.clone().into()),
+				icon: config.icon,
+				name: config.name.unwrap_or(config.brand),
+			})
+			.collect()
+	});
+
+	let show_sso = identity_providers
+		.as_ref()
+		.is_none_or(|providers| !providers.is_empty());
+
+	let appservice = Some(LoginType::ApplicationService(ApplicationServiceLoginType::default()));
+
+	let token = Some(LoginType::Token(TokenLoginType { get_login_token }));
+
+	let password = services
 		.config
-		.identity_provider
-		.values()
-		.filter(|_| list_idps)
-		.cloned()
-		.map(|config| IdentityProvider {
-			id: config.id().to_owned(),
-			brand: Some(config.brand.clone().into()),
-			icon: config.icon,
-			name: config.name.unwrap_or(config.brand),
+		.login_with_password
+		.then(|| LoginType::Password(PasswordLoginType::default()));
+
+	let sso = show_sso.then(|| {
+		LoginType::Sso(SsoLoginType {
+			identity_providers: identity_providers.unwrap_or_default(),
+			oauth_aware_preferred: services.config.oidc_aware_preferred,
 		})
+	});
+
+	let jwt = services
+		.config
+		.jwt
+		.enable
+		.then(|| LoginType::Jwt(JwtLoginType::default()));
+
+	let flows = [appservice, token, password, sso, jwt]
+		.into_iter()
+		.flatten()
 		.collect();
 
-	let flows = [
-		LoginType::ApplicationService(ApplicationServiceLoginType::default()),
-		LoginType::Jwt(JwtLoginType::default()),
-		LoginType::Password(PasswordLoginType::default()),
-		LoginType::Token(TokenLoginType { get_login_token }),
-		LoginType::Sso(SsoLoginType {
-			identity_providers,
-			oauth_aware_preferred: services.config.oidc_aware_preferred,
-		}),
-	];
-
-	Ok(get_login_types::v3::Response {
-		flows: flows
-			.into_iter()
-			.filter(|login_type| match login_type {
-				| LoginType::Sso(SsoLoginType { identity_providers, .. })
-					if list_idps && identity_providers.is_empty() =>
-					false,
-				| LoginType::Password(_) => services.config.login_with_password,
-				| LoginType::Jwt(_) => services.config.jwt.enable,
-				| _ => true,
-			})
-			.collect(),
-	})
+	Ok(get_login_types::v3::Response { flows })
 }
 
 /// # `POST /_matrix/client/v3/login`
@@ -97,7 +107,7 @@ pub(crate) async fn get_login_types_route(
 ///
 /// - The user needs to authenticate using their password (or if enabled using a
 ///   json web token)
-/// - If `device_id` is known: invalidates old access token of that device
+/// - If `device_id` is known: issues an additional access token for that device
 /// - If `device_id` is unknown: creates a new device
 /// - Returns access token that is associated with the user and device
 ///
@@ -112,9 +122,11 @@ pub(crate) async fn login_route(
 ) -> Result<login::v3::Response> {
 	// Validate login method
 	let user_id = match &body.login_info {
-		| LoginInfo::Password(info) => password::handle_login(&services, &body, info).await?,
+		| LoginInfo::Password(info) if services.config.login_with_password =>
+			password::handle_login(&services, &body, info).await?,
 		| LoginInfo::Token(info) => token::handle_login(&services, &body, info).await?,
-		| LoginInfo::Jwt(info) => jwt::handle_login(&services, &body, info).await?,
+		| LoginInfo::Jwt(info) if services.config.jwt.enable =>
+			jwt::handle_login(&services, &body, info).await?,
 		| LoginInfo::ApplicationService(info) =>
 			appservice::handle_login(&services, &body, info)?,
 		| _ => {
@@ -125,6 +137,8 @@ pub(crate) async fn login_route(
 			))));
 		},
 	};
+
+	services.users.locked_check(&user_id).await?;
 
 	// Generate a new token for the device
 	let (access_token, expires_in) = services

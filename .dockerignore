@@ -5,6 +5,8 @@ target/
 # Docker files
 Dockerfile*
 docker/
+!docker/lib/
+!docker/lib/*
 
 # IDE files
 .vscode

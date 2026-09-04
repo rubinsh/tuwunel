@@ -8,6 +8,10 @@ use rocksdb::{
 };
 use tuwunel_core::{Config, debug, debug::INFO_SPAN_LEVEL, debug_info, error, info, warn};
 
+/// Bridges RocksDB background events into structured tracing.
+///
+/// The listener records stalls, compactions, flushes, memtable seals, and
+/// external file ingestion without retaining per-event state.
 pub(super) struct Events;
 
 impl Events {
@@ -16,8 +20,13 @@ impl Events {
 
 impl EventListener for Events {
 	#[tracing::instrument(name = "error", level = "error", skip_all)]
-	fn on_background_error(&self, reason: DBBackgroundErrorReason, _status: MutableStatus) {
-		error!(error = ?reason, "Critical RocksDB Error");
+	fn on_background_error(&self, reason: DBBackgroundErrorReason, status: MutableStatus) {
+		error!(
+			?reason,
+			severity = ?status.severity(),
+			error = ?status.result().as_ref().err(),
+			"Critical RocksDB Error",
+		);
 	}
 
 	#[tracing::instrument(name = "stall", level = "warn", skip_all)]

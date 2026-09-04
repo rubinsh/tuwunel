@@ -1,5 +1,6 @@
 use std::{
 	collections::BTreeMap,
+	ops::ControlFlow,
 	sync::{Arc, RwLock},
 };
 
@@ -7,17 +8,18 @@ use futures::{TryStreamExt, pin_mut};
 use ruma::{
 	CanonicalJsonValue, DeviceId, OwnedDeviceId, OwnedUserId, UserId,
 	api::{
-		client::uiaa::{AuthData, AuthType, Password, UiaaInfo, UserIdentifier},
+		client::uiaa::{
+			AuthData, AuthType, EmailIdentity, Password, ThirdpartyIdCredentials, UiaaInfo,
+			UserIdentifier,
+		},
 		error::{ErrorKind, StandardErrorBody},
 	},
 };
 use tuwunel_core::{
 	Err, Result, err, error, extract, implement,
-	utils::{self, BoolExt, hash, string::EMPTY},
+	utils::{self, BoolExt, hash::verify_password, string::EMPTY},
 };
 use tuwunel_database::{Deserialized, Json, Map};
-
-use crate::users::PASSWORD_SENTINEL;
 
 pub struct Service {
 	userdevicesessionid_uiaarequest: RwLock<RequestMap>,
@@ -33,6 +35,12 @@ type RequestMap = BTreeMap<RequestKey, CanonicalJsonValue>;
 type RequestKey = (OwnedUserId, OwnedDeviceId, String);
 
 pub const SESSION_ID_LENGTH: usize = 32;
+
+#[derive(Clone, Copy)]
+enum EmailIdentityMode {
+	Validate,
+	Claim,
+}
 
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
@@ -69,14 +77,46 @@ pub fn create(
 	self.update_uiaa_session(user_id, device_id, session, Some(uiaainfo));
 }
 
+/// Authenticate one stage without taking ownership of an email proof.
+///
+/// Generic UIAA consumers may validate email identity, but only registration
+/// assigns a durable owner to that proof.
 #[implement(Service)]
-#[allow(clippy::useless_let_if_seq)]
 pub async fn try_auth(
 	&self,
 	user_id: &UserId,
 	device_id: &DeviceId,
 	auth: &AuthData,
 	uiaainfo: &UiaaInfo,
+) -> Result<(bool, UiaaInfo)> {
+	self.try_auth_inner(user_id, device_id, auth, uiaainfo, EmailIdentityMode::Validate)
+		.await
+}
+
+/// Authenticate one registration stage and claim an email proof when present.
+///
+/// The claim is tied to the exact user, device, and UIAA session tuple before
+/// the email stage is recorded as complete.
+#[implement(Service)]
+pub async fn try_auth_registration(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	auth: &AuthData,
+	uiaainfo: &UiaaInfo,
+) -> Result<(bool, UiaaInfo)> {
+	self.try_auth_inner(user_id, device_id, auth, uiaainfo, EmailIdentityMode::Claim)
+		.await
+}
+
+#[implement(Service)]
+async fn try_auth_inner(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	auth: &AuthData,
+	uiaainfo: &UiaaInfo,
+	email_identity_mode: EmailIdentityMode,
 ) -> Result<(bool, UiaaInfo)> {
 	let mut uiaainfo = if let Some(session) = auth.session() {
 		self.get_uiaa_session(user_id, device_id, session)
@@ -91,74 +131,13 @@ pub async fn try_auth(
 
 	match auth {
 		// Find out what the user completed
-		| AuthData::Password(Password { identifier, password, user, .. }) => {
-			let username = extract!(identifier, x in Some(UserIdentifier::Matrix(ruma::api::client::uiaa::MatrixUserIdentifier { user: x, .. })))
-				.or_else(|| cfg!(feature = "element_hacks").and(user.as_ref()))
-				.ok_or(err!(Request(Unrecognized("Identifier type not recognized."))))?;
-
-			let user_id_from_username = UserId::parse_with_server_name(
-				username.clone(),
-				self.services.globals.server_name(),
-			)
-			.map_err(|_| err!(Request(InvalidParam("User ID is invalid."))))?;
-
-			// Check if the access token being used matches the credentials used for UIAA
-			if user_id.localpart() != user_id_from_username.localpart() {
-				return Err!(Request(Forbidden("User ID and access token mismatch.")));
-			}
-
-			// Check if password is correct
-			let user_id = user_id_from_username;
-			let mut password_verified = false;
-			let mut password_sentinel = false;
-
-			// First try local password hash verification
-			if let Ok(hash) = self.services.users.password_hash(&user_id).await {
-				password_sentinel = hash == PASSWORD_SENTINEL;
-				password_verified = hash::verify_password(password, &hash).is_ok();
-			}
-
-			// If local password verification failed, try LDAP authentication
-			#[cfg(feature = "ldap")]
-			if !password_verified && self.services.server.config.ldap.enable {
-				// Search for user in LDAP to get their DN
-				if let Ok(dns) = self.services.users.search_ldap(&user_id).await
-					&& let Some((user_dn, _is_admin)) = dns.first()
-				{
-					// Try to authenticate with LDAP
-					password_verified = self
-						.services
-						.users
-						.auth_ldap(user_dn, password)
-						.await
-						.is_ok();
-				}
-			}
-
-			// For SSO users that have never set a password, allow.
-			if !password_verified
-				&& password_sentinel
-				&& self
-					.services
-					.oauth
-					.sessions
-					.exists_for_user(&user_id)
-					.await
+		| AuthData::Password(password) => {
+			if let ControlFlow::Break(authed) = self
+				.verify_password(user_id, &mut uiaainfo, password)
+				.await?
 			{
-				return Ok((true, uiaainfo));
+				return Ok((authed, uiaainfo));
 			}
-
-			if !password_verified {
-				uiaainfo.auth_error = Some(StandardErrorBody {
-					kind: ErrorKind::forbidden(),
-					message: "Invalid username or password.".to_owned(),
-				});
-
-				return Ok((false, uiaainfo));
-			}
-
-			// Password was correct! Let's add it to `completed`
-			uiaainfo.completed.push(AuthType::Password);
 		},
 		| AuthData::RegistrationToken(t) => {
 			let token = t.token.trim();
@@ -173,26 +152,17 @@ pub async fn try_auth(
 					.completed
 					.push(AuthType::RegistrationToken);
 			} else {
-				uiaainfo.auth_error = Some(StandardErrorBody {
+				uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
 					kind: ErrorKind::forbidden(),
 					message: "Invalid registration token.".to_owned(),
-				});
+				}));
 
 				return Ok((false, uiaainfo));
 			}
 		},
 		| AuthData::FallbackAcknowledgement(_session) => {
-			// FallbackAcknowledgement is used for SSO and other fallback flows.
-			// The SSO callback route marks the session as completed by adding
-			// AuthType::Sso.
-			if !uiaainfo.completed.contains(&AuthType::Sso) {
-				uiaainfo.auth_error = Some(StandardErrorBody {
-					kind: ErrorKind::forbidden(),
-					message: "SSO authentication not completed for this session.".to_owned(),
-				});
-
-				return Ok((false, uiaainfo));
-			}
+			// A fallback acknowledgement is a session re-poll. The fallback
+			// web handler (e.g. the SSO callback) is what records completion.
 		},
 		| AuthData::OAuth(_) => {
 			// MSC4312: OAuth cross-signing reset uses SSO re-authentication.
@@ -206,11 +176,11 @@ pub async fn try_auth(
 				{
 					uiaainfo.completed.push(AuthType::OAuth);
 				} else {
-					uiaainfo.auth_error = Some(StandardErrorBody {
+					uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
 						kind: ErrorKind::forbidden(),
 						message: "OAuth cross-signing reset not approved for this session."
 							.to_owned(),
-					});
+					}));
 
 					return Ok((false, uiaainfo));
 				}
@@ -218,6 +188,33 @@ pub async fn try_auth(
 		},
 		| AuthData::Dummy(_) => {
 			uiaainfo.completed.push(AuthType::Dummy);
+		},
+		| AuthData::Terms(_) => {
+			// MSC1692: an empty auth dict accepts every presented policy.
+			uiaainfo.completed.push(AuthType::Terms);
+		},
+		| AuthData::EmailIdentity(EmailIdentity { thirdparty_id_creds, .. }) => {
+			// A stray id_server is tolerated and id_access_token is never required.
+			let validated = self
+				.authenticate_email_identity(
+					user_id,
+					device_id,
+					&uiaainfo,
+					thirdparty_id_creds,
+					email_identity_mode,
+				)
+				.await?;
+
+			if !validated {
+				uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
+					kind: ErrorKind::forbidden(),
+					message: "Email address has not been validated.".to_owned(),
+				}));
+
+				return Ok((false, uiaainfo));
+			}
+
+			uiaainfo.completed.push(AuthType::EmailIdentity);
 		},
 		| auth => error!("AuthData type not supported: {auth:?}"),
 	}
@@ -239,16 +236,149 @@ pub async fn try_auth(
 		.as_ref()
 		.expect("session is always set");
 
+	if matches!(email_identity_mode, EmailIdentityMode::Claim)
+		&& !matches!(auth, AuthData::EmailIdentity(_))
+		&& uiaainfo
+			.completed
+			.contains(&AuthType::EmailIdentity)
+	{
+		let claim = (user_id.to_owned(), device_id.to_owned(), session.as_str().into());
+
+		if !self
+			.services
+			.threepid
+			.refresh_claim(&claim)
+			.await?
+		{
+			uiaainfo
+				.completed
+				.retain(|stage| stage != &AuthType::EmailIdentity);
+
+			uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
+				kind: ErrorKind::forbidden(),
+				message: "Email address has not been validated.".to_owned(),
+			}));
+
+			self.update_uiaa_session(user_id, device_id, session, Some(&uiaainfo));
+
+			return Ok((false, uiaainfo));
+		}
+	}
+
 	if !completed {
 		self.update_uiaa_session(user_id, device_id, session, Some(&uiaainfo));
 
 		return Ok((false, uiaainfo));
 	}
 
-	// UIAA was successful! Remove this session and return true
-	self.update_uiaa_session(user_id, device_id, session, None);
+	// Retain the session until registration spends its email claim.
+	let retain_session = matches!(email_identity_mode, EmailIdentityMode::Claim)
+		&& uiaainfo
+			.completed
+			.contains(&AuthType::EmailIdentity);
+
+	self.update_uiaa_session(user_id, device_id, session, retain_session.then_some(&uiaainfo));
 
 	Ok((true, uiaainfo))
+}
+
+#[implement(Service)]
+async fn authenticate_email_identity(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	uiaainfo: &UiaaInfo,
+	creds: &ThirdpartyIdCredentials,
+	mode: EmailIdentityMode,
+) -> Result<bool> {
+	match mode {
+		| EmailIdentityMode::Validate => Ok(self
+			.services
+			.threepid
+			.session_validated(creds.sid.as_str(), creds.client_secret.as_str())
+			.await),
+		| EmailIdentityMode::Claim => {
+			let session = uiaainfo
+				.session
+				.as_ref()
+				.expect("session is always set");
+
+			let claim = (user_id.to_owned(), device_id.to_owned(), session.as_str().into());
+
+			self.services
+				.threepid
+				.claim_validated(creds.sid.as_str(), creds.client_secret.as_str(), claim)
+				.await
+		},
+	}
+}
+
+#[implement(Service)]
+async fn verify_password(
+	&self,
+	user_id: &UserId,
+	uiaainfo: &mut UiaaInfo,
+	password: &Password,
+) -> Result<ControlFlow<bool>> {
+	let Password { identifier, password, user, .. } = password;
+
+	let username = extract!(identifier, x in Some(UserIdentifier::Matrix(ruma::api::client::uiaa::MatrixUserIdentifier { user: x, .. })))
+		.or_else(|| cfg!(feature = "element_hacks").and(user.as_ref()))
+		.ok_or(err!(Request(Unrecognized("Identifier type not recognized."))))?;
+
+	let user_id_from_username =
+		UserId::parse_with_server_name(username.clone(), self.services.globals.server_name())
+			.map_err(|_| err!(Request(InvalidParam("User ID is invalid."))))?;
+
+	// Check if the access token being used matches the credentials used for UIAA
+	if user_id.localpart() != user_id_from_username.localpart() {
+		return Err!(Request(Forbidden("User ID and access token mismatch.")));
+	}
+
+	let user_id = user_id_from_username;
+	// First try local password hash verification
+	let password_verified = self
+		.services
+		.users
+		.password_hash(&user_id)
+		.await
+		.is_ok_and(|hash| verify_password(password, &hash).is_ok());
+
+	// Only LDAP-origin accounts fall back to LDAP; others would trigger a
+	// directory-wide search.
+	#[cfg(feature = "ldap")]
+	let password_verified = if !password_verified
+		&& self.services.server.config.ldap.enable
+		&& self
+			.services
+			.users
+			.origin(&user_id)
+			.await
+			.is_ok_and(|origin| origin == "ldap")
+		&& let Ok(dns) = self.services.users.search_ldap(&user_id).await
+		&& let Some((user_dn, _is_admin)) = dns.first()
+	{
+		self.services
+			.users
+			.auth_ldap(user_dn, password)
+			.await
+			.is_ok()
+	} else {
+		password_verified
+	};
+
+	if !password_verified {
+		uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
+			kind: ErrorKind::forbidden(),
+			message: "Invalid username or password.".to_owned(),
+		}));
+
+		return Ok(ControlFlow::Break(false));
+	}
+
+	uiaainfo.completed.push(AuthType::Password);
+
+	Ok(ControlFlow::Continue(()))
 }
 
 #[implement(Service)]

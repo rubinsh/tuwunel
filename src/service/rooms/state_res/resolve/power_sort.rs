@@ -1,8 +1,4 @@
-use std::{
-	borrow::Borrow,
-	collections::{HashMap, HashSet},
-	iter::once,
-};
+use std::{collections::HashMap, iter::once};
 
 use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::FuturesUnordered};
 use ruma::{
@@ -16,13 +12,16 @@ use tuwunel_core::{
 	utils::stream::{BroadbandExt, IterStream, TryBroadbandExt},
 };
 
-use super::super::{
-	events::{
-		RoomCreateEvent, RoomPowerLevelsEvent, RoomPowerLevelsIntField, is_power_event,
-		power_levels::RoomPowerLevelsEventOptionExt,
+use super::{
+	super::{
+		events::{
+			RoomCreateEvent, RoomPowerLevelsEvent, RoomPowerLevelsIntField, is_power_event,
+			power_levels::RoomPowerLevelsEventOptionExt,
+		},
+		topological_sort,
+		topological_sort::ReferencedIds,
 	},
-	topological_sort,
-	topological_sort::ReferencedIds,
+	ConflictedSet,
 };
 
 /// Enlarge the given list of conflicted power events by adding the events in
@@ -52,7 +51,7 @@ use super::super::{
 )]
 pub(super) async fn power_sort<Fetch, Fut, Pdu>(
 	rules: &RoomVersionRules,
-	full_conflicted_set: &HashSet<OwnedEventId>,
+	full_conflicted_set: &ConflictedSet,
 	fetch: &Fetch,
 ) -> Result<Vec<OwnedEventId>>
 where
@@ -84,7 +83,7 @@ where
 		.map_ok(AsRef::as_ref)
 		.broad_and_then(|event_id| {
 			power_level_for_sender(event_id, rules, fetch)
-				.map_ok(move |sender_power| (event_id, sender_power))
+				.map_ok(move |sender_power| (event_id.to_owned(), sender_power))
 				.map_err(|e| err!(Request(NotFound("Missing PL for sender: {e}"))))
 		})
 		.try_collect()
@@ -92,14 +91,14 @@ where
 
 	let query = async |event_id: OwnedEventId| {
 		let power_level = *event_to_power_level
-			.get(&event_id.borrow())
+			.get(&event_id)
 			.ok_or_else(|| err!(Request(NotFound("Missing PL event: {event_id}"))))?;
 
 		let event = fetch(event_id).await?;
 		Ok((power_level, event.origin_server_ts()))
 	};
 
-	topological_sort(&graph, &query).await
+	topological_sort(graph, &query).await
 }
 
 /// Add the event with the given event ID and all the events in its auth chain
@@ -115,7 +114,7 @@ where
 	)
 )]
 async fn add_event_auth_chain<Fetch, Fut, Pdu>(
-	full_conflicted_set: &HashSet<OwnedEventId>,
+	full_conflicted_set: &ConflictedSet,
 	mut graph: HashMap<OwnedEventId, ReferencedIds>,
 	event_id: OwnedEventId,
 	fetch: &Fetch,

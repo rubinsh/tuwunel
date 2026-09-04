@@ -6,7 +6,7 @@ use futures::{
 	future::{join, join4, join5},
 };
 use ruma::{
-	OwnedRoomId, RoomId, ServerName, UInt, UserId,
+	OwnedRoomAliasId, OwnedRoomId, RoomAliasId, RoomId, ServerName, UInt, UserId,
 	api::{
 		client::{
 			directory::{
@@ -22,13 +22,14 @@ use ruma::{
 	uint,
 };
 use tuwunel_core::{
-	Err, Result, err, info,
+	Err, Error, Result, err, info,
 	matrix::Event,
 	utils::{
 		TryFutureExtExt,
 		math::Expected,
 		stream::{IterStream, ReadyExt, WidebandExt},
 	},
+	warn,
 };
 use tuwunel_service::Services;
 
@@ -47,7 +48,7 @@ pub(crate) async fn get_public_rooms_filtered_route(
 ) -> Result<get_public_rooms_filtered::v3::Response> {
 	check_server_banned(&services, body.server.as_deref())?;
 
-	let response = get_public_rooms_filtered_helper(
+	get_public_rooms_filtered_helper(
 		&services,
 		body.server.as_deref(),
 		body.limit,
@@ -55,12 +56,8 @@ pub(crate) async fn get_public_rooms_filtered_route(
 		&body.filter,
 		&body.room_network,
 	)
+	.map_err(|e| mask_remote_failure(&services, body.server.as_deref(), e))
 	.await
-	.map_err(|e| {
-		err!(Request(Unknown(warn!(?body.server, "Failed to return /publicRooms: {e}"))))
-	})?;
-
-	Ok(response)
 }
 
 /// # `GET /_matrix/client/v3/publicRooms`
@@ -84,10 +81,8 @@ pub(crate) async fn get_public_rooms_route(
 		&Filter::default(),
 		&RoomNetwork::Matrix,
 	)
-	.await
-	.map_err(|e| {
-		err!(Request(Unknown(warn!(?body.server, "Failed to return /publicRooms: {e}"))))
-	})?;
+	.map_err(|e| mask_remote_failure(&services, body.server.as_deref(), e))
+	.await?;
 
 	Ok(get_public_rooms::v3::Response {
 		chunk: response.chunk,
@@ -142,33 +137,39 @@ pub(crate) async fn set_room_visibility_route(
 					body.room_id
 				);
 
-				if services.server.config.admin_room_notices {
-					services
-						.admin
-						.send_text(&format!(
-							"Non-admin user {sender_user} tried to publish {0} to the room \
-							 directory while \"lockdown_public_room_directory\" is enabled",
-							body.room_id
-						))
-						.await;
-				}
+				services
+					.admin
+					.notify_loud(&format!(
+						"Non-admin user {sender_user} tried to publish {0} to the room \
+						 directory while \"lockdown_public_room_directory\" is enabled",
+						body.room_id
+					))
+					.await;
 
 				return Err!(Request(Forbidden(
 					"Publishing rooms to the room directory is not allowed",
 				)));
 			}
 
-			services.directory.set_public(&body.room_id);
+			// Preserve the alias the room was published under.
+			let published_alias = services
+				.directory
+				.published_alias(&body.room_id)
+				.await
+				.ok();
 
-			if services.server.config.admin_room_notices {
-				services
-					.admin
-					.send_text(&format!(
-						"{sender_user} made {} public to the room directory",
-						body.room_id
-					))
-					.await;
-			}
+			services
+				.directory
+				.set_public(&body.room_id, published_alias.as_deref());
+
+			services
+				.admin
+				.notify_loud(&format!(
+					"{sender_user} made {} public to the room directory",
+					body.room_id
+				))
+				.await;
+
 			info!("{sender_user} made {0} public to the room directory", body.room_id);
 		},
 		| room::Visibility::Private => services.directory.set_not_public(&body.room_id),
@@ -213,9 +214,7 @@ pub(crate) async fn get_public_rooms_filtered_helper(
 	filter: &Filter,
 	_network: &RoomNetwork,
 ) -> Result<get_public_rooms_filtered::v3::Response> {
-	if let Some(other_server) =
-		server.filter(|server_name| !services.globals.server_is_ours(server_name))
-	{
+	if let Some(other_server) = remote_server(services, server) {
 		let response = services
 			.federation
 			.execute(
@@ -393,21 +392,7 @@ async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> Public
 		.get_room_type(&room_id)
 		.ok();
 
-	let canonical_alias = services
-		.state_accessor
-		.get_canonical_alias(&room_id)
-		.ok()
-		.then(async |alias| {
-			if let Some(alias) = alias
-				&& services.globals.alias_is_local(&alias)
-				&& let Ok(alias_room_id) = services.alias.resolve_local_alias(&alias).await
-				&& alias_room_id == room_id
-			{
-				Some(alias)
-			} else {
-				None
-			}
-		});
+	let canonical_alias = directory_alias(services, &room_id);
 
 	let avatar_url = services
 		.state_accessor
@@ -464,6 +449,35 @@ async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> Public
 	}
 }
 
+/// Alias for the room's directory entry: the alias it was published under
+/// while it still resolves to the room, else the room's canonical alias.
+async fn directory_alias(services: &Services, room_id: &RoomId) -> Option<OwnedRoomAliasId> {
+	if let Ok(alias) = services.directory.published_alias(room_id).await
+		&& alias_resolves_to(services, &alias, room_id).await
+	{
+		return Some(alias);
+	}
+
+	let alias = services
+		.state_accessor
+		.get_canonical_alias(room_id)
+		.await
+		.ok()?;
+
+	alias_resolves_to(services, &alias, room_id)
+		.await
+		.then_some(alias)
+}
+
+async fn alias_resolves_to(services: &Services, alias: &RoomAliasId, room_id: &RoomId) -> bool {
+	services.globals.alias_is_local(alias)
+		&& services
+			.alias
+			.resolve_local_alias(alias)
+			.await
+			.is_ok_and(|resolved| resolved == room_id)
+}
+
 fn check_server_banned(services: &Services, server: Option<&ServerName>) -> Result {
 	let Some(server) = server else {
 		return Ok(());
@@ -481,4 +495,32 @@ fn check_server_banned(services: &Services, server: Option<&ServerName>) -> Resu
 	}
 
 	Ok(())
+}
+
+/// Masks a remote directory failure behind a generic gateway error.
+///
+/// The remote chooses its own error, so forwarding one verbatim lets a third
+/// party pick what our client sees. A query served locally contacts nobody, so
+/// its error is returned unchanged rather than relabelled as an upstream
+/// failure.
+fn mask_remote_failure(services: &Services, server: Option<&ServerName>, error: Error) -> Error {
+	let Some(server) = remote_server(services, server) else {
+		return error;
+	};
+
+	warn!(%server, %error, "Failed to query remote public rooms directory");
+
+	err!(Request(ConnectionFailed("Unable to query the remote public rooms directory.")))
+}
+
+/// The server a directory query is routed to, when that server is not us.
+///
+/// Routing the query and masking its failure both read this, so the set of
+/// requests that reach a third party cannot drift from the set whose errors are
+/// masked.
+fn remote_server<'a>(
+	services: &Services,
+	server: Option<&'a ServerName>,
+) -> Option<&'a ServerName> {
+	server.filter(|server| !services.globals.server_is_ours(server))
 }

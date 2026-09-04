@@ -1,0 +1,28 @@
+accessibility/keyboard-navigation.spec.ts :: without an open room
+composer/CIDER.spec.ts :: render emoji picker
+crypto/crypto.spec.ts :: creating a DM should work, being e2e-encrypted / user verification
+crypto/crypto.spec.ts :: should allow verification when there is no existing DM
+crypto/decryption-failure-messages.spec.ts :: should display undecryptable non-joined historical messages with a different message
+crypto/decryption-failure-messages.spec.ts :: should handle device-relative historical messages
+crypto/device-verification.spec.ts :: Verify device with Recovery Key during login
+crypto/device-verification.spec.ts :: Verify device with Recovery Key from settings
+crypto/event-shields.spec.ts :: should show correct shields on events sent by users with changed identity
+crypto/event-shields.spec.ts :: should show the correct shield on e2e events
+crypto/event-shields.spec.ts :: should show the correct shield on edited e2e events
+crypto/history-sharing.spec.ts :: Messages sent when we believed the room history was unshared should not be visible
+crypto/user-verification.spec.ts :: can abort emoji verification when emoji mismatch
+crypto/user-verification.spec.ts :: can receive a verification request when there is no existing DM
+lazy-loading/lazy-loading.spec.ts :: should handle lazy loading properly even when offline
+settings/account-user-settings-tab.spec.ts :: should display an error if the code is incorrect when adding a phone number
+settings/appearance-user-settings-tab/message-layout-panel.spec.ts :: should change the message layout from modern to bubble
+settings/appearance-user-settings-tab/message-layout-panel.spec.ts :: should disable compact layout when the modern layout is not selected
+settings/appearance-user-settings-tab/message-layout-panel.spec.ts :: should enable compact layout when the modern layout is selected
+settings/encryption-user-tab/other-devices.spec.ts :: verified devices should be able to decrypt while global blacklist is toggled
+settings/encryption-user-tab/recovery.spec.ts :: should setup the recovery key
+sliding-sync/sliding-sync.spec.ts :: should show and be able to accept/reject/rescind invites
+spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should order by recency after notification level
+spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should show a highlight indicator when there is a mention in a thread
+spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should show a notification indicator when there is a message in a thread
+spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should show the rooms with unread threads
+spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should update with a thread is read
+timeline/timeline.spec.ts :: should show historical profiles if disabled

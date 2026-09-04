@@ -142,6 +142,20 @@ fn invalid_room_create() {
 	);
 	check_room_create(&RoomCreateEvent::new(event), &AuthorizationRules::V1).unwrap_err();
 
+	// With an authorization event.
+	let content = json!({ "creator": alice() });
+	let event = to_pdu_event(
+		"CREATE",
+		alice(),
+		TimelineEventType::RoomCreate,
+		Some(""),
+		to_raw_json_value(&content).unwrap(),
+		&["MESSAGE"],
+		&[],
+	);
+
+	check_room_create(&RoomCreateEvent::new(event), &AuthorizationRules::V1).unwrap_err();
+
 	// Sender with a different domain.
 	let creator = user_id!("@bot:bar");
 	let content = json!({
@@ -580,7 +594,6 @@ async fn auth_event_in_different_room() {
 		prev_events: vec![event_id("IMA")].into(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		signatures: None,
 		//rejected: false,
 	};
 	init_events
@@ -719,7 +732,6 @@ async fn rejected_auth_event() {
 		prev_events: vec![event_id("IMA")].into(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		signatures: None,
 		//rejected: true,
 	};
 	init_events
@@ -812,7 +824,6 @@ async fn event_without_room_id() {
 		prev_events: [owned_event_id!("$IPOWER")].into(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		signatures: None,
 		//rejected: false,
 	};
 

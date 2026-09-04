@@ -1,5 +1,8 @@
 mod watch;
 
+#[cfg(test)]
+mod tests;
+
 use std::{
 	collections::{BTreeMap, btree_map::Entry},
 	sync::Arc,
@@ -255,16 +258,27 @@ pub fn update_rooms_prologue(&mut self, retard_since: Option<u64>) {
 	});
 }
 
+/// Advance the per-room cursor for each complete bounded room range.
+///
+/// `roomsince` is the lower bound of every content query for its room. Only
+/// rooms whose complete range was safely assembled may advance. A failed room
+/// keeps its cursor and retries the same range after a later wake.
 #[implement(Connection)]
 #[tracing::instrument(level = "debug", skip_all)]
-pub fn update_rooms_epilogue<'a, Rooms>(&mut self, window: Rooms)
+pub fn update_rooms_epilogue<'a, Complete>(&mut self, complete: Complete)
 where
-	Rooms: Iterator<Item = &'a RoomId> + Send + 'a,
+	Complete: Iterator<Item = &'a RoomId> + Send + 'a,
 {
-	window.for_each(|room_id| {
-		let room = self.rooms.entry(room_id.into()).or_default();
-
-		room.roomsince = self.next_batch;
+	let next_batch = self.next_batch;
+	complete.for_each(|room_id| {
+		if let Some(room) = self.rooms.get_mut(room_id) {
+			room.roomsince = next_batch;
+		} else {
+			self.rooms
+				.entry(room_id.into())
+				.or_default()
+				.roomsince = next_batch;
+		}
 	});
 }
 
@@ -291,21 +305,12 @@ fn update_cache_lists(request: &Request, cached: &mut Self) {
 
 #[implement(Connection)]
 fn update_cache_list(request: &request::List, cached: &mut request::List) {
+	cached.ranges.clone_from(&request.ranges);
 	list_or_sticky(&request.room_details.required_state, &mut cached.room_details.required_state);
 
-	match (&request.filters, &mut cached.filters) {
-		| (None, None) => {},
-		| (None, Some(_cached)) => {},
-		| (Some(request), None) => cached.filters = Some(request.clone()),
-		| (Some(request), Some(cached)) => {
-			some_or_sticky(request.is_dm.as_ref(), &mut cached.is_dm);
-			some_or_sticky(request.is_encrypted.as_ref(), &mut cached.is_encrypted);
-			some_or_sticky(request.is_invite.as_ref(), &mut cached.is_invite);
-			list_or_sticky(&request.room_types, &mut cached.room_types);
-			list_or_sticky(&request.not_room_types, &mut cached.not_room_types);
-			list_or_sticky(&request.tags, &mut cached.not_tags);
-			list_or_sticky(&request.spaces, &mut cached.spaces);
-		},
+	// Clients re-send filters each request; replace so a dropped one clears.
+	if request.filters.is_some() {
+		cached.filters.clone_from(&request.filters);
 	}
 }
 

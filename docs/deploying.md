@@ -52,9 +52,24 @@ and `-v3-` CPU-optimized variants. Running the wrong one produces an
 variant your CPU supports; `-v2-` or better is recommended for RocksDB's CRC32
 performance.
 
-**RocksDB is the only supported database.** SQLite support has been removed. If
-you are migrating from Conduit, you will need a migration tool before deploying
-Tuwunel.
+**Debian and Ubuntu have an apt repository.** Instead of downloading packages by
+hand, add the repository from the [Debian guide](deploying/debian.md) and install
+with `apt install tuwunel`; upgrades then arrive through `apt upgrade`. Installing
+the package also adopts an existing conduwuit or Conduit database automatically.
+
+**RocksDB is the only supported database.** SQLite support has been removed. A
+RocksDB database from Conduit or a fork of conduwuit migrates in place on first
+boot: stop the source server, back up its data directory and media, then start
+Tuwunel against it. Tuwunel reconciles the schema version, room history, account
+data, and media automatically; no flags are required. For a Conduit source using
+the content-addressed media layout, set
+`conduit_media_directory_depth` and `conduit_media_directory_length` to match its
+`media.directory_structure`: Conduit v0.10.0 stored media flat, so use
+`conduit_media_directory_depth = 0`, while v0.10.1 and later shard it (the
+default). If media lived outside `<database_path>/media`, set
+`conduit_source_media_path`; if it lived in an S3 bucket, see
+[importing media from a Conduit S3 bucket](media/storage.md#importing-media-from-a-conduit-s3-bucket).
+SQLite databases are not supported.
 
 **Port 8448 matters for federation.** Clients connect on port 443, but other
 Matrix homeservers connect on port 8448. Both must be reachable for a fully

@@ -1,52 +1,48 @@
 use std::collections::HashSet;
 
-use futures::{
-	FutureExt, StreamExt, TryFutureExt,
-	future::{join3, ready},
-	pin_mut,
-};
+use futures::{FutureExt, StreamExt, TryFutureExt, future::ready, pin_mut};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedServerName, RoomId, UserId,
 	api::federation,
 	canonical_json::to_canonical_value,
 	events::{
-		StateEventType,
+		AnyStrippedStateEvent, StateEventType,
 		room::member::{MembershipState, RoomMemberEventContent},
 	},
+	serde::Raw,
 };
 use tuwunel_core::{
-	Err, Result, debug_info, debug_warn, err, implement,
+	Err, Error, Result, async_noinline, debug_info, debug_warn, err, implement,
 	matrix::{PduCount, pdu::check_rules, room_version},
 	pdu::PduBuilder,
-	utils::{
-		self, FutureBoolExt,
-		future::{ReadyBoolExt, TryExtExt},
-	},
+	utils::{self, FutureBoolExt, future::ReadyBoolExt},
 	warn,
 };
 
 use super::Service;
-use crate::rooms::timeline::RoomMutexGuard;
+use crate::rooms::{state_cache::MembershipUpdate, timeline::RoomMutexGuard};
 
 #[implement(Service)]
+#[async_noinline]
 #[tracing::instrument(
+    name = "leave",
     level = "debug",
     skip_all,
     fields(%room_id, %user_id)
 )]
-pub async fn leave(
-	&self,
-	user_id: &UserId,
-	room_id: &RoomId,
+pub async fn leave<'a>(
+	&'a self,
+	user_id: &'a UserId,
+	room_id: &'a RoomId,
 	reason: Option<String>,
 	remote_leave_now: bool,
-	state_lock: &RoomMutexGuard,
+	state_lock: &'a RoomMutexGuard,
 ) -> Result {
-	let default_member_content = RoomMemberEventContent {
+	let leave_content = RoomMemberEventContent {
 		membership: MembershipState::Leave,
 		reason: reason.clone(),
 		join_authorized_via_users_server: None,
-		is_direct: None,
+		is_direct: false,
 		avatar_url: None,
 		displayname: None,
 		third_party_invite: None,
@@ -55,27 +51,11 @@ pub async fn leave(
 
 	let is_banned = self.services.metadata.is_banned(room_id);
 	let is_disabled = self.services.metadata.is_disabled(room_id);
-
 	pin_mut!(is_banned, is_disabled);
 	if is_banned.or(is_disabled).await {
-		// the room is banned/disabled, the room must be rejected locally since we
-		// cant/dont want to federate with this server
-		let count = self.services.globals.next_count();
-		self.services
-			.state_cache
-			.update_membership(
-				room_id,
-				user_id,
-				default_member_content,
-				user_id,
-				None,
-				None,
-				true,
-				PduCount::Normal(*count),
-			)
-			.await?;
-
-		return Ok(());
+		return self
+			.clear_local_leave(user_id, room_id, leave_content, None)
+			.await;
 	}
 
 	let member_event = self
@@ -101,90 +81,169 @@ pub async fn leave(
 		.is_knocked(user_id, room_id)
 		.is_false();
 
-	// Ask a remote server if we don't have this room and are not knocking on it
 	if remote_leave_now || dont_have_room.and(not_knocked).await {
-		if let Err(e) = self
-			.remote_leave(user_id, room_id, reason)
-			.boxed()
+		self.leave_via_remote(user_id, room_id, reason, leave_content)
 			.await
-		{
-			warn!(%user_id, "Failed to leave room {room_id} remotely: {e}");
-			// Don't tell the client about this error
-		}
-
-		let last_state = self
-			.services
-			.state_cache
-			.invite_state(user_id, room_id)
-			.or_else(|_| {
-				self.services
-					.state_cache
-					.knock_state(user_id, room_id)
-			})
-			.or_else(|_| {
-				self.services
-					.state_cache
-					.left_state(user_id, room_id)
-			})
-			.await
-			.ok();
-
-		// We always drop the invite, we can't rely on other servers
-		let count = self.services.globals.next_count();
-		self.services
-			.state_cache
-			.update_membership(
-				room_id,
-				user_id,
-				default_member_content,
-				user_id,
-				last_state,
-				None,
-				true,
-				PduCount::Normal(*count),
-			)
-			.await?;
 	} else {
-		let Ok(event) = member_event else {
-			debug_warn!(
-				"Trying to leave a room you are not a member of, marking room as left locally."
-			);
+		self.leave_locally(user_id, room_id, reason, leave_content, member_event, state_lock)
+			.await
+	}
+}
 
-			let count = self.services.globals.next_count();
-			return self
-				.services
-				.state_cache
-				.update_membership(
-					room_id,
-					user_id,
-					default_member_content,
-					user_id,
-					None,
-					None,
-					true,
-					PduCount::Normal(*count),
-				)
-				.await;
-		};
-
-		self.services
-			.timeline
-			.build_and_append_pdu(
-				PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {
-					membership: MembershipState::Leave,
-					reason,
-					join_authorized_via_users_server: None,
-					is_direct: None,
-					..event
-				}),
-				user_id,
-				room_id,
-				state_lock,
-			)
-			.await?;
+#[implement(Service)]
+async fn leave_via_remote(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	reason: Option<String>,
+	leave_content: RoomMemberEventContent,
+) -> Result {
+	if let Err(e) = self
+		.remote_leave(user_id, room_id, reason)
+		.boxed()
+		.await
+	{
+		warn!(%user_id, "Failed to leave room {room_id} remotely: {e}");
 	}
 
-	Ok(())
+	let last_state = self
+		.last_known_strip_state(user_id, room_id)
+		.await;
+
+	self.clear_local_leave(user_id, room_id, leave_content, last_state)
+		.await
+}
+
+#[implement(Service)]
+async fn last_known_strip_state(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+) -> Option<Vec<Raw<AnyStrippedStateEvent>>> {
+	self.services
+		.state_cache
+		.invite_state(user_id, room_id)
+		.or_else(|_| {
+			self.services
+				.state_cache
+				.knock_state(user_id, room_id)
+		})
+		.or_else(|_| {
+			self.services
+				.state_cache
+				.left_state(user_id, room_id)
+		})
+		.await
+		.ok()
+}
+
+#[implement(Service)]
+async fn leave_locally(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	reason: Option<String>,
+	leave_content: RoomMemberEventContent,
+	member_event: Result<RoomMemberEventContent>,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	let Ok(event) = member_event else {
+		debug_warn!(
+			"Trying to leave a room you are not a member of, marking room as left locally."
+		);
+
+		return self
+			.clear_local_leave(user_id, room_id, leave_content, None)
+			.await;
+	};
+
+	if !is_leaveable(&event.membership) {
+		debug_warn!(
+			current = ?event.membership,
+			"Room state shows non-leaveable membership; clearing local caches.",
+		);
+
+		return self
+			.clear_local_leave(user_id, room_id, leave_content, None)
+			.await;
+	}
+
+	let build_result = self
+		.services
+		.timeline
+		.build_and_append_pdu(
+			PduBuilder::state(user_id.to_string(), &RoomMemberEventContent {
+				membership: MembershipState::Leave,
+				reason,
+				join_authorized_via_users_server: None,
+				is_direct: false,
+				..event
+			}),
+			user_id,
+			room_id,
+			state_lock,
+		)
+		.await;
+
+	// On state-res auth-check rejection, re-read membership. The pre-check above
+	// and the auth_check inside build_and_append_pdu both run under state_lock,
+	// so they observe the same state; re-reading here narrows the swallow to
+	// non-leaveable membership (Leave/Ban/_Custom), which is the stale-state
+	// population this branch targets. Genuine auth_check rejections against
+	// fresh Invite/Join/Knock state propagate unchanged.
+	match build_result {
+		| Ok(_) => Ok(()),
+		| Err(Error::AuthCheck(inner)) => {
+			let current = self
+				.services
+				.state_accessor
+				.room_state_get_content::<RoomMemberEventContent>(
+					room_id,
+					&StateEventType::RoomMember,
+					user_id.as_str(),
+				)
+				.await
+				.map(|c| c.membership);
+
+			if current.as_ref().is_ok_and(is_leaveable) {
+				return Err(Error::AuthCheck(inner));
+			}
+
+			warn!(
+				error = %inner,
+				?current,
+				"Auth refused self-leave PDU; clearing local caches.",
+			);
+
+			self.clear_local_leave(user_id, room_id, leave_content, None)
+				.await
+		},
+		| Err(e) => Err(e),
+	}
+}
+
+#[implement(Service)]
+async fn clear_local_leave(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	leave_content: RoomMemberEventContent,
+	last_state: Option<Vec<Raw<AnyStrippedStateEvent>>>,
+) -> Result {
+	let count = self.services.globals.next_count();
+	self.services
+		.state_cache
+		.update_membership(MembershipUpdate {
+			room_id,
+			user_id,
+			membership_event: leave_content,
+			sender: user_id,
+			last_state,
+			invite_via: None,
+			update_joined_count: true,
+			count: PduCount::Normal(*count),
+		})
+		.await
 }
 
 #[implement(Service)]
@@ -236,11 +295,8 @@ async fn remote_leave(
 							.filter_map(|event| event.get_field("sender").ok().flatten())
 							.filter_map(|sender: &str| UserId::parse(sender).ok())
 							.filter_map(|sender| {
-								if !self.services.globals.user_is_local(&sender) {
-									Some(sender.server_name().to_owned())
-								} else {
-									None
-								}
+								(!self.services.globals.user_is_local(&sender))
+									.then(|| sender.server_name().to_owned())
 							}),
 					);
 				},
@@ -305,24 +361,17 @@ async fn remote_leave(
 			)))
 		})?;
 
-	let displayname = self.services.users.displayname(user_id).ok();
+	let mut content = RoomMemberEventContent {
+		reason,
+		..RoomMemberEventContent::new(MembershipState::Leave)
+	};
 
-	let avatar_url = self.services.users.avatar_url(user_id).ok();
+	self.services
+		.profile
+		.fill_profile_data(user_id, &mut content)
+		.await;
 
-	let blurhash = self.services.users.blurhash(user_id).ok();
-
-	let (displayname, avatar_url, blurhash) = join3(displayname, avatar_url, blurhash).await;
-
-	event.insert(
-		"content".into(),
-		to_canonical_value(RoomMemberEventContent {
-			displayname,
-			avatar_url,
-			blurhash,
-			reason,
-			..RoomMemberEventContent::new(MembershipState::Leave)
-		})?,
-	);
+	event.insert("content".into(), to_canonical_value(content)?);
 
 	event.insert(
 		"origin".into(),
@@ -369,4 +418,11 @@ async fn remote_leave(
 		.await?;
 
 	Ok(())
+}
+
+/// Membership states permitted to transition to `Leave` via a self-leave PDU.
+/// ruma's `MembershipState` is `#[non_exhaustive]`; future variants are
+/// conservatively treated as non-leaveable.
+fn is_leaveable(state: &MembershipState) -> bool {
+	matches!(state, MembershipState::Invite | MembershipState::Join | MembershipState::Knock,)
 }

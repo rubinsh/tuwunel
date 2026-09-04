@@ -27,12 +27,18 @@ fn user(name: &str) -> OwnedUserId { format!("@{name}:test.srv").parse().unwrap(
 
 fn room(name: &str) -> OwnedRoomId { format!("!{name}:test.srv").parse().unwrap() }
 
+#[expect(
+	clippy::needless_pass_by_value,
+	reason = "callers construct JSON values inline"
+)]
 fn entry(counter: u64, kind: &str, sender: &str, body: serde_json::Value) -> EphemeralEntry {
 	EphemeralEntry {
 		counter,
 		event_type: kind.to_owned(),
 		sender: user(sender),
-		origin_server_ts: 1_700_000_000_000 + counter,
+		origin_server_ts: 1_700_000_000_000_u64
+			.checked_add(counter)
+			.unwrap(),
 		content: serde_json::value::to_raw_value(&body).unwrap(),
 	}
 }
@@ -57,14 +63,16 @@ fn push_preserves_order_within_capacity() {
 #[test]
 fn push_evicts_oldest_past_capacity() {
 	let mut ring: VecDeque<EphemeralEntry> = VecDeque::new();
-	for i in 1..=(MAX_ENTRIES_PER_ROOM as u64 + 50) {
+	let capacity = u64::try_from(MAX_ENTRIES_PER_ROOM).unwrap();
+	let last_counter = capacity.checked_add(50).unwrap();
+	for i in 1..=last_counter {
 		push_with_eviction(&mut ring, entry(i, "com.example.t", "alice", json!({ "i": i })));
 	}
 	assert_eq!(ring.len(), MAX_ENTRIES_PER_ROOM);
 	let first = ring.front().unwrap();
 	let last = ring.back().unwrap();
 	assert_eq!(first.counter, 51);
-	assert_eq!(last.counter, MAX_ENTRIES_PER_ROOM as u64 + 50);
+	assert_eq!(last.counter, last_counter);
 }
 
 #[test]
@@ -144,7 +152,7 @@ fn fast_burst_is_observed_when_consumer_polls_late() {
 				.unwrap()
 				.as_str()
 				.unwrap()
-				.to_string()
+				.to_owned()
 		})
 		.collect();
 	assert_eq!(labels, vec!["Thinking", "Bash", "Thinking", "Read", "Thinking", "null"]);
@@ -189,13 +197,13 @@ fn two_senders_in_one_room_do_not_overwrite() {
 		.iter()
 		.map(|e| {
 			let body: serde_json::Value = serde_json::from_str(e.content.get()).unwrap();
-			(e.sender.localpart().to_string(), body["working"].as_str().unwrap().to_string())
+			(e.sender.localpart().to_owned(), body["working"].as_str().unwrap().to_owned())
 		})
 		.collect();
 	assert_eq!(pairs, vec![
-		("matrix-bot".to_string(), "Bash".to_string()),
-		("matrix-channel-dev".to_string(), "Edit".to_string()),
-		("matrix-bot".to_string(), "Read".to_string()),
+		("matrix-bot".to_owned(), "Bash".to_owned()),
+		("matrix-channel-dev".to_owned(), "Edit".to_owned()),
+		("matrix-bot".to_owned(), "Read".to_owned()),
 	],);
 }
 

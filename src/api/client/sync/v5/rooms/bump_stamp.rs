@@ -1,4 +1,4 @@
-use futures::{StreamExt, pin_mut};
+use futures::{TryStreamExt, pin_mut};
 use ruma::{
 	RoomId, UInt, UserId,
 	events::TimelineEventType::{
@@ -6,12 +6,12 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	is_equal_to,
+	Result, is_equal_to,
 	matrix::{
 		Event,
 		pdu::{PduCount, PduEvent},
 	},
-	utils::stream::ReadyExt,
+	utils::TryReadyExt,
 };
 use tuwunel_service::Services;
 
@@ -32,25 +32,23 @@ pub(super) async fn room_bump_stamp(
 	roomsince: PduCount,
 	next_batch: PduCount,
 	last_timeline_count: PduCount,
-) -> Option<UInt> {
+) -> Result<Option<UInt>> {
 	if last_timeline_count <= roomsince {
-		return None;
+		return Ok(None);
 	}
 
 	let bumpable_pdus = services
 		.timeline
-		.pdus_rev(Some(sender_user), room_id, None)
-		.ready_filter_map(Result::ok)
-		.ready_skip_while(|&(pdu_count, _)| pdu_count > next_batch)
-		.ready_take_while(|&(pdu_count, _)| pdu_count > roomsince)
-		.ready_filter_map(|(pdu_count, pdu)| {
-			is_bumpable_pdu(&pdu, sender_user)
+		.pdus_rev(Some(sender_user), room_id, Some(next_batch.saturating_add(1)))
+		.ready_try_take_while(|&(pdu_count, _)| Ok(pdu_count > roomsince))
+		.ready_try_filter_map(|(pdu_count, pdu)| {
+			Ok(is_bumpable_pdu(&pdu, sender_user)
 				.then(|| pdu_count.into_signed().try_into().ok())
-				.flatten()
+				.flatten())
 		});
 
 	pin_mut!(bumpable_pdus);
-	bumpable_pdus.next().await
+	bumpable_pdus.try_next().await
 }
 
 fn is_bumpable_pdu(pdu: &PduEvent, sender_user: &UserId) -> bool {
@@ -69,7 +67,7 @@ fn is_bumpable_pdu(pdu: &PduEvent, sender_user: &UserId) -> bool {
 		.is_ok()
 }
 
-#[cfg_attr(debug_assertions, tuwunel_core::ctor)]
+#[cfg_attr(debug_assertions, tuwunel_core::ctor(unsafe))]
 fn _is_sorted() {
 	debug_assert!(
 		DEFAULT_BUMP_TYPES.is_sorted(),
@@ -89,8 +87,11 @@ mod tests {
 	use super::{DEFAULT_BUMP_TYPES, is_bumpable_pdu};
 
 	fn pdu(kind: TimelineEventType, state_key: Option<StateKey>, redacted: bool) -> PduEvent {
-		let unsigned = redacted
-			.then(|| to_raw_value(&json!({ "redacted_because": {} })).expect("valid unsigned"));
+		let unsigned = redacted.then(|| {
+			to_raw_value(&json!({ "redacted_because": {} }))
+				.expect("valid unsigned")
+				.into()
+		});
 
 		PduEvent {
 			kind,
@@ -109,7 +110,6 @@ mod tests {
 			hashes: Default::default(),
 			origin: None,
 			unsigned,
-			signatures: None,
 		}
 	}
 

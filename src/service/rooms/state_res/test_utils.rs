@@ -1,6 +1,6 @@
 use std::{
 	borrow::Borrow,
-	collections::HashMap,
+	collections::{BTreeSet, HashMap},
 	pin::Pin,
 	slice,
 	sync::{
@@ -55,198 +55,234 @@ pub(super) async fn do_check(
 	// To activate logging use `RUST_LOG=debug cargo t`
 
 	let init_events = INITIAL_EVENTS();
+	let mut store = build_test_store(&init_events, events);
+	let (graph, fake_event_map) = build_event_graph(&init_events, events, &edges);
 
-	let mut store = TestStore(
+	let mut event_map: HashMap<OwnedEventId, PduEvent> = HashMap::new();
+	let mut state_at_event: HashMap<OwnedEventId, StateMap<OwnedEventId>> = HashMap::new();
+
+	let sorted = super::topological_sort(graph.clone(), &async |_id| {
+		Ok((int!(0).into(), MilliSecondsSinceUnixEpoch(uint!(0))))
+	})
+	.await
+	.unwrap();
+
+	for node in sorted {
+		let fake_event = &fake_event_map[&node];
+		let event_id = fake_event.event_id().to_owned();
+		let prev_events = &graph[&node];
+
+		let state_before =
+			resolve_state_before(&store, &event_map, &state_at_event, &node, prev_events).await;
+
+		let auth_events = collect_auth_events(fake_event, &state_before);
+		let state_after = state_after_with(&state_before, fake_event, &event_id);
+		let event = rebuild_with_auth(fake_event, &auth_events, prev_events);
+
+		store.0.insert(event_id.clone(), event.clone());
+		event_map.insert(event_id.clone(), store.0[&event_id].clone());
+		state_at_event.insert(node, state_after);
+	}
+
+	let expected_state = build_expected_state(&expected_state_ids, &event_map);
+	let end_state = compute_end_state(&state_at_event, &expected_state);
+
+	assert_eq!(expected_state, end_state);
+}
+
+fn build_test_store(
+	init_events: &HashMap<OwnedEventId, PduEvent>,
+	events: &[PduEvent],
+) -> TestStore {
+	TestStore(
 		init_events
 			.values()
 			.chain(events)
 			.map(|ev| (ev.event_id().to_owned(), ev.clone()))
 			.collect(),
-	);
+	)
+}
 
-	// This will be lexi_topo_sorted for resolution
+fn build_event_graph(
+	init_events: &HashMap<OwnedEventId, PduEvent>,
+	events: &[PduEvent],
+	edges: &[Vec<OwnedEventId>],
+) -> (HashMap<OwnedEventId, ReferencedIds>, HashMap<OwnedEventId, PduEvent>) {
 	let mut graph = HashMap::<OwnedEventId, ReferencedIds>::new();
-	// This is the same as in `resolve` event_id -> OriginalStateEvent
 	let mut fake_event_map = HashMap::new();
 
-	// Create the DB of events that led up to this point
-	// TODO maybe clean up some of these clones it is just tests but...
 	for ev in init_events.values().chain(events) {
 		graph.insert(ev.event_id().to_owned(), Default::default());
 		fake_event_map.insert(ev.event_id().to_owned(), ev.clone());
 	}
 
-	for pair in INITIAL_EDGES().windows(2) {
-		if let [a, b] = &pair {
+	add_chain_edges(&mut graph, &INITIAL_EDGES());
+	for edge_list in edges {
+		add_chain_edges(&mut graph, edge_list);
+	}
+
+	(graph, fake_event_map)
+}
+
+fn add_chain_edges(graph: &mut HashMap<OwnedEventId, ReferencedIds>, chain: &[OwnedEventId]) {
+	for pair in chain.windows(2) {
+		if let [a, b] = pair {
 			graph
 				.entry(a.to_owned())
 				.or_default()
 				.push(b.clone());
 		}
 	}
+}
 
-	for edge_list in edges {
-		for pair in edge_list.windows(2) {
-			if let [a, b] = &pair {
-				graph
-					.entry(a.to_owned())
-					.or_default()
-					.push(b.clone());
-			}
-		}
+async fn resolve_state_before(
+	store: &TestStore,
+	event_map: &HashMap<OwnedEventId, PduEvent>,
+	state_at_event: &HashMap<OwnedEventId, StateMap<OwnedEventId>>,
+	node: &EventId,
+	prev_events: &[OwnedEventId],
+) -> StateMap<OwnedEventId> {
+	match prev_events {
+		| [] => StateMap::new(),
+		| [single] => state_at_event[single].clone(),
+		| _ => merge_prev_states(store, event_map, state_at_event, node, prev_events).await,
 	}
+}
 
-	// event_id -> PduEvent
-	let mut event_map: HashMap<OwnedEventId, PduEvent> = HashMap::new();
-	// event_id -> StateMap<OwnedEventId>
-	let mut state_at_event: HashMap<OwnedEventId, StateMap<OwnedEventId>> = HashMap::new();
+async fn merge_prev_states(
+	store: &TestStore,
+	event_map: &HashMap<OwnedEventId, PduEvent>,
+	state_at_event: &HashMap<OwnedEventId, StateMap<OwnedEventId>>,
+	node: &EventId,
+	prev_events: &[OwnedEventId],
+) -> StateMap<OwnedEventId> {
+	let state_sets = prev_events
+		.iter()
+		.filter_map(|k| state_at_event.get(k).cloned())
+		.collect::<Vec<_>>();
 
-	// Resolve the current state and add it to the state_at_event map then continue
-	// on in "time"
-	for node in super::topological_sort(&graph, &async |_id| {
-		Ok((int!(0).into(), MilliSecondsSinceUnixEpoch(uint!(0))))
-	})
+	info!(
+		"{:#?}",
+		state_sets
+			.iter()
+			.map(|map| map
+				.iter()
+				.map(|((ty, key), id)| format!("(({ty}{key:?}), {id})"))
+				.collect::<Vec<_>>())
+			.collect::<Vec<_>>()
+	);
+
+	let auth_chain_sets = state_sets
+		.iter()
+		.map(|map| {
+			store
+				.auth_event_ids(room_id(), map.values().cloned().collect())
+				.unwrap()
+		})
+		.collect::<Vec<_>>();
+
+	let rules = RoomVersionRules::V6;
+	super::resolve(
+		&rules,
+		state_sets.into_iter().stream(),
+		auth_chain_sets.into_iter().stream(),
+		&async |id| event_map.get(&id).cloned().ok_or_else(not_found),
+		&async |id| event_map.contains_key(&id),
+		false,
+	)
 	.await
+	.unwrap_or_else(|e| panic!("resolution for {node} failed: {e}"))
+}
+
+fn state_after_with(
+	state_before: &StateMap<OwnedEventId>,
+	fake_event: &PduEvent,
+	event_id: &EventId,
+) -> StateMap<OwnedEventId> {
+	let mut state_after = state_before.clone();
+	let ty = fake_event.event_type();
+	let key = fake_event.state_key().unwrap();
+	state_after.insert(ty.with_state_key(key), event_id.to_owned());
+	state_after
+}
+
+fn collect_auth_events(
+	fake_event: &PduEvent,
+	state_before: &StateMap<OwnedEventId>,
+) -> Vec<OwnedEventId> {
+	auth_types_for_event(
+		fake_event.event_type(),
+		fake_event.sender(),
+		fake_event.state_key(),
+		fake_event.content(),
+		&AuthorizationRules::V6,
+		false,
+	)
 	.unwrap()
-	{
-		let fake_event = &fake_event_map[&node];
-		let event_id = fake_event.event_id().to_owned();
+	.into_iter()
+	.filter_map(|key| state_before.get(&key).cloned())
+	.collect()
+}
 
-		let prev_events = &graph[&node];
+fn rebuild_with_auth(
+	fake_event: &PduEvent,
+	auth_events: &[OwnedEventId],
+	prev_events: &[OwnedEventId],
+) -> PduEvent {
+	to_pdu_event(
+		fake_event.event_id().as_str(),
+		fake_event.sender(),
+		fake_event.event_type().clone(),
+		fake_event.state_key(),
+		fake_event.content().to_owned(),
+		auth_events,
+		prev_events,
+	)
+}
 
-		let state_before: StateMap<OwnedEventId> = if prev_events.is_empty() {
-			StateMap::new()
-		} else if prev_events.len() == 1 {
-			state_at_event[prev_events.iter().next().unwrap()].clone()
-		} else {
-			let state_sets = prev_events
-				.iter()
-				.filter_map(|k| state_at_event.get(k).cloned())
-				.collect::<Vec<_>>();
+fn build_expected_state(
+	expected_state_ids: &[OwnedEventId],
+	event_map: &HashMap<OwnedEventId, PduEvent>,
+) -> StateMap<OwnedEventId> {
+	expected_state_ids
+		.iter()
+		.map(|node| {
+			let ev = event_map.get(node).unwrap_or_else(|| {
+				panic!(
+					"{node} not found in {:?}",
+					event_map
+						.keys()
+						.map(ToString::to_string)
+						.collect::<Vec<_>>()
+				)
+			});
+			let key = ev
+				.event_type()
+				.with_state_key(ev.state_key().unwrap());
+			(key, node.clone())
+		})
+		.collect()
+}
 
-			info!(
-				"{:#?}",
-				state_sets
-					.iter()
-					.map(|map| map
-						.iter()
-						.map(|((ty, key), id)| format!("(({ty}{key:?}), {id})"))
-						.collect::<Vec<_>>())
-					.collect::<Vec<_>>()
-			);
-
-			let auth_chain_sets = state_sets
-				.iter()
-				.map(|map| {
-					store
-						.auth_event_ids(room_id(), map.values().cloned().collect())
-						.unwrap()
-				})
-				.collect::<Vec<_>>();
-
-			let state_sets = state_sets.into_iter().stream();
-
-			let rules = RoomVersionRules::V6;
-			let resolved = super::resolve(
-				&rules,
-				state_sets,
-				auth_chain_sets.into_iter().stream(),
-				&async |id| event_map.get(&id).cloned().ok_or_else(not_found),
-				&async |id| event_map.contains_key(&id),
-				false,
-			)
-			.await;
-
-			match resolved {
-				| Ok(state) => state,
-				| Err(e) => panic!("resolution for {node} failed: {e}"),
-			}
-		};
-
-		let mut state_after = state_before.clone();
-
-		let ty = fake_event.event_type();
-		let key = fake_event.state_key().unwrap();
-		state_after.insert(ty.with_state_key(key), event_id.clone());
-
-		let auth_types = auth_types_for_event(
-			fake_event.event_type(),
-			fake_event.sender(),
-			fake_event.state_key(),
-			fake_event.content(),
-			&AuthorizationRules::V6,
-			false,
-		)
-		.unwrap();
-
-		let mut auth_events = vec![];
-		for key in auth_types {
-			if state_before.contains_key(&key) {
-				auth_events.push(state_before[&key].clone());
-			}
-		}
-
-		// TODO The event is just remade, adding the auth_events and prev_events here
-		// the `to_pdu_event` was split into `init` and the fn below, could be better
-		let e = fake_event;
-		let ev_id = e.event_id();
-		let event = to_pdu_event(
-			e.event_id().as_str(),
-			e.sender(),
-			e.event_type().clone(),
-			e.state_key(),
-			e.content().to_owned(),
-			&auth_events,
-			&prev_events.iter().cloned().collect::<Vec<_>>(),
-		);
-
-		// We have to update our store, an actual user of this lib would
-		// be giving us state from a DB.
-		store.0.insert(ev_id.to_owned(), event.clone());
-
-		state_at_event.insert(node, state_after);
-		event_map.insert(event_id.clone(), store.0[ev_id].clone());
-	}
-
-	let mut expected_state = StateMap::new();
-	for node in expected_state_ids {
-		let ev = event_map.get(&node).unwrap_or_else(|| {
-			panic!(
-				"{node} not found in {:?}",
-				event_map
-					.keys()
-					.map(ToString::to_string)
-					.collect::<Vec<_>>()
-			)
-		});
-
-		let key = ev
-			.event_type()
-			.with_state_key(ev.state_key().unwrap());
-
-		expected_state.insert(key, node);
-	}
-
+fn compute_end_state(
+	state_at_event: &HashMap<OwnedEventId, StateMap<OwnedEventId>>,
+	expected_state: &StateMap<OwnedEventId>,
+) -> StateMap<OwnedEventId> {
 	let start_state = state_at_event
 		.get(event_id!("$START:foo"))
 		.unwrap();
 
-	let end_state = state_at_event
+	state_at_event
 		.get(event_id!("$END:foo"))
 		.unwrap()
 		.iter()
 		.filter(|(k, v)| {
 			expected_state.contains_key(k)
 				|| start_state.get(k) != Some(*v)
-                // Filter out the dummy messages events.
-                // These act as points in time where there should be a known state to
-                // test against.
-                && **k != ("m.room.message".into(), "dummy".into())
+					&& **k != ("m.room.message".into(), "dummy".into())
 		})
 		.map(|(k, v)| (k.clone(), v.clone()))
-		.collect::<StateMap<OwnedEventId>>();
-
-	assert_eq!(expected_state, end_state);
+		.collect()
 }
 
 pub(super) struct TestStore(pub(super) HashMap<OwnedEventId, PduEvent>);
@@ -259,13 +295,16 @@ impl TestStore {
 			.ok_or_else(|| event_not_found(event_id))
 	}
 
-	/// Returns a Vec of the related auth events to the given `event`.
+	/// Collects the requested event ids and their recursive auth event ids.
+	///
+	/// Each identifier appears at most once. Traversal fails if a required
+	/// event is absent from the store.
 	pub(super) fn auth_event_ids(
 		&self,
 		room_id: &RoomId,
 		event_ids: Vec<OwnedEventId>,
 	) -> Result<AuthSet<OwnedEventId>> {
-		let mut result = AuthSet::new();
+		let mut result = BTreeSet::new();
 		let mut stack = event_ids;
 
 		// DFS for auth event chain
@@ -281,7 +320,7 @@ impl TestStore {
 			stack.extend(event.auth_events().map(ToOwned::to_owned));
 		}
 
-		Ok(result)
+		Ok(AuthSet::from_distinct(result.into_iter().collect()))
 	}
 }
 
@@ -449,7 +488,6 @@ pub(super) fn to_init_pdu_event(
 		prev_events: Default::default(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		signatures: None,
 		//rejected: false,
 	}
 }
@@ -499,7 +537,6 @@ where
 		prev_events,
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		signatures: None,
 		//rejected: false,
 	}
 }
@@ -554,7 +591,6 @@ where
 		prev_events,
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		signatures: None,
 		//rejected: false,
 	}
 }
@@ -602,7 +638,6 @@ where
 		prev_events,
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		signatures: None,
 		//rejected: false,
 	}
 }
@@ -639,7 +674,6 @@ pub(super) fn room_create_hydra_pdu_event(
 		prev_events: Default::default(),
 		depth: uint!(0),
 		hashes: EventHash::default(),
-		signatures: None,
 		//rejected: false,
 	}
 }

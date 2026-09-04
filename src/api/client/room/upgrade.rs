@@ -214,6 +214,9 @@ async fn upgrade_room_create(
 		.map_err(|_| err!(Database("Found room without m.room.create event.")))?;
 
 	content.remove("creator");
+	// MSC4291: v12 create events omit the deprecated predecessor.event_id.
+	let predecessor = PreviousRoom { event_id: None, ..predecessor };
+
 	content.insert("predecessor".into(), json!(predecessor).try_into()?);
 	content.insert("room_version".into(), json!(new_version).try_into()?);
 
@@ -242,7 +245,7 @@ async fn upgrade_room_create(
 		.build_and_append_pdu(
 			PduBuilder {
 				event_type: TimelineEventType::RoomCreate,
-				content: to_raw_value(&content)?,
+				content: to_raw_value(&content)?.into(),
 				state_key: Some(StateKey::new()),
 				..Default::default()
 			},
@@ -288,14 +291,11 @@ async fn upgrade_room_create_legacy(
 
 	// Send a m.room.create event containing a predecessor field and the applicable
 	// room_version. "creator" key no longer exists in V11+ rooms.
-	{
-		use RoomVersionId::*;
-		match new_version {
-			| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 =>
-				content.insert("creator".into(), json!(&sender_user).try_into()?),
-			| _ => content.remove("creator"),
-		}
-	};
+	if !version_rules.authorization.use_room_create_sender {
+		content.insert("creator".into(), json!(&sender_user).try_into()?);
+	} else {
+		content.remove("creator");
+	}
 
 	content.insert("predecessor".into(), json!(predecessor).try_into()?);
 	content.insert("room_version".into(), json!(new_version).try_into()?);
@@ -311,7 +311,7 @@ async fn upgrade_room_create_legacy(
 		.build_and_append_pdu(
 			PduBuilder {
 				event_type: TimelineEventType::RoomCreate,
-				content: to_raw_value(&content)?,
+				content: to_raw_value(&content)?.into(),
 				state_key: Some(StateKey::new()),
 				..Default::default()
 			},
@@ -334,6 +334,8 @@ async fn transfer_room(&self) -> Result {
 	self.move_space_state().await?;
 
 	self.move_sender_user().await?;
+
+	self.move_push_rules().await?;
 
 	self.move_local_aliases().await?;
 
@@ -378,6 +380,15 @@ async fn move_sender_user(&self) -> Result {
 	}
 
 	Ok(())
+}
+
+#[implement(RoomUpgradeContext, params = "<'_>")]
+#[tracing::instrument(level = "debug")]
+async fn move_push_rules(&self) -> Result {
+	self.services
+		.account_data
+		.copy_room_push_rule(self.sender_user, self.old_room_id, self.new_room_id)
+		.await
 }
 
 #[implement(RoomUpgradeContext, params = "<'_>")]
@@ -443,6 +454,9 @@ async fn move_state_events(&self) -> Result {
 // MSC4168: copy m.space.parent for any room, plus m.space.child when the
 // old room is itself a space, into the upgraded room.
 #[implement(RoomUpgradeContext, params = "<'_>")]
+// try_for_each requires FnMut returning a nameable future; an async closure
+// capturing self does not satisfy it.
+#[expect(closure_returning_async_block)]
 #[tracing::instrument(level = "debug")]
 async fn move_space_state(&self) -> Result {
 	let old_room_is_space = self
@@ -463,40 +477,44 @@ async fn move_space_state(&self) -> Result {
 		| false => &[StateEventType::SpaceParent],
 	};
 
-	for event_type in event_types {
-		let state_keys: Vec<StateKey> = self
-			.services
-			.state_accessor
-			.room_state_keys(self.old_room_id, event_type)
-			.ignore_err()
-			.collect()
-			.await;
-
-		for state_key in state_keys {
-			let Ok(event) = self
-				.services
-				.state_accessor
-				.room_state_get(self.old_room_id, event_type, &state_key)
-				.await
-			else {
-				continue;
-			};
-
+	event_types
+		.iter()
+		.stream()
+		.map(Ok)
+		.try_for_each(|event_type| {
 			self.services
-				.timeline
-				.build_and_append_pdu(
-					self.rebuild_state_event(&event).await?,
-					self.creator,
-					self.new_room_id,
-					self.new_state_lock,
-				)
-				.inspect_err(|e| error!(?event, ?self, "Failed to copy space state: {e}"))
-				.await
-				.ok();
-		}
-	}
+				.state_accessor
+				.room_state_keys(self.old_room_id, event_type)
+				.ignore_err()
+				.map(Ok)
+				.try_for_each(move |state_key| async move {
+					let Ok(event) = self
+						.services
+						.state_accessor
+						.room_state_get(self.old_room_id, event_type, &state_key)
+						.await
+					else {
+						return Ok(());
+					};
 
-	Ok(())
+					self.services
+						.timeline
+						.build_and_append_pdu(
+							self.rebuild_state_event(&event).await?,
+							self.creator,
+							self.new_room_id,
+							self.new_state_lock,
+						)
+						.inspect_err(|e| {
+							error!(?event, ?self, "Failed to copy space state: {e}");
+						})
+						.await
+						.ok();
+
+					Ok(())
+				})
+		})
+		.await
 }
 
 #[implement(RoomUpgradeContext, params = "<'_>")]
@@ -576,7 +594,7 @@ async fn rebuild_state_event<Pdu: Event>(&self, event: &Pdu) -> Result<PduBuilde
 	};
 
 	Ok(PduBuilder {
-		content,
+		content: content.into(),
 		event_type: event.kind().clone(),
 		state_key: event.state_key().map(Into::into),
 		..Default::default()

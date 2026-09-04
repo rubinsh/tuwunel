@@ -75,10 +75,14 @@ uri = "ldaps://ldap.example.org:636"
 bind_dn = "cn={username},ou=users,dc=example,dc=org"
 ```
 
-This is the simplest mode but has two limitations: it cannot apply a search
-filter (so anyone in the bind DN's subtree can log in), and **admin
-synchronization does not work** because Tuwunel never gets a chance to query
-the directory under a service account.
+This is the simplest mode but has three limitations. It cannot apply a search
+filter, so anyone in the bind DN's subtree can log in. **Admin
+synchronization does not work**, because Tuwunel never gets a chance to query
+the directory under a service account. And there is **no local-password
+fallback**: that fallback is triggered by a search returning no matches, and
+this mode runs no search, so every `m.login.password` request is decided by
+the directory alone. An account that must keep a working local password, such
+as a bootstrap admin, cannot log in while direct-bind mode is active.
 
 ## Configuration reference
 
@@ -90,15 +94,20 @@ the directory under a service account.
 | `bind_dn` | — | DN used for the initial bind. Contains `{username}` for direct-bind mode; otherwise identifies a service account. Omit for anonymous search. |
 | `bind_password_file` | — | Path to a file containing the password for `bind_dn`. Ignored in direct-bind mode (the user's login password is used). |
 | `filter` | `"(objectClass=*)"` | LDAP search filter applied during user lookup. Supports `{username}` substitution. |
-| `uid_attribute` | `"uid"` | Attribute that uniquely identifies the user. Returned entries must contain the user's localpart in this attribute (or in `name_attribute`). |
-| `name_attribute` | `"givenName"` | Secondary attribute checked for the localpart. Useful when login should match either an account name or a display name. |
+| `uid_attribute` | `"uid"` | Attribute that uniquely identifies the user. Returned entries must contain the user's localpart in this attribute. |
 | `admin_base_dn` | `""` | Subtree for the admin search. Falls back to `base_dn` when empty. |
 | `admin_filter` | `""` | Filter that selects administrative users. Empty disables admin synchronization entirely. Supports `{username}` substitution. |
 
 The localpart match is case-insensitive — Tuwunel sends a lowercased version
 of the localpart through `{username}` substitution and accepts an entry if
-either the original or lowercased form appears in `uid_attribute` or
-`name_attribute`.
+either the original or lowercased form appears in `uid_attribute`.
+
+Certificate verification for `ldaps://` follows the server-wide
+`allow_invalid_tls_certificates` setting rather than any LDAP-specific option.
+That setting is meant for development and disables verification on every
+outbound TLS connection, the directory connection included, so an unvalidated
+certificate is accepted whenever it is on. Leave it off in production: an LDAP
+simple bind carries the user's password over that connection.
 
 ## Admin synchronization
 
@@ -140,10 +149,37 @@ against the directory.
 Subsequent logins reuse the existing account and only update admin status
 if `admin_filter` is configured.
 
-Deactivating a user in LDAP prevents future logins but does **not**
-automatically deactivate or delete the corresponding Matrix account. Use
+### Accounts that already existed locally
+
+A directory entry claims any local account sharing its localpart, whatever
+that account's origin. If `alice` registered with a local password before
+LDAP was enabled, and the directory also holds an entry for `alice`, her
+logins are verified by binding against the directory from then on and her
+local password is no longer consulted. An account created through SSO behaves
+the same way.
+
+This is deliberate. A directory configured here is treated as an authority on
+identity, so a successful bind for a localpart establishes that the caller is
+that user. It also means whoever administers the directory can authenticate
+as any Tuwunel user whose localpart they are able to add or control. Where
+directory administrators are not also homeserver administrators, or where
+`filter` is scoped more widely than your homeserver's own user base, narrow
+`filter` before enabling LDAP on a server that already has accounts.
+
+### Deactivation
+
+Deactivation does not propagate between the two systems in either direction,
+but it is enforced on both sides at login.
+
+Removing or disabling a user in LDAP prevents future logins and does **not**
+deactivate or delete the corresponding Matrix account. Use
 `!admin users deactivate` if you also want to remove access to existing
 sessions and devices.
+
+A Matrix account deactivated with `!admin users deactivate` is refused at
+login even when its directory entry is still present and its password still
+binds successfully. Deactivation also revokes every existing session, so a
+deactivated user cannot keep using tokens issued before it.
 
 ## Admin commands for testing
 
@@ -160,10 +196,11 @@ Both commands are gated by the `ldap` build feature.
 
 ## Disabling password login for non-LDAP users
 
-Tuwunel's LDAP integration always falls back to local password verification
-when the LDAP search returns no matches. To enforce LDAP-only login for
-everyone (apart from accounts that authenticate via SSO), pair LDAP with a
-restrictive `filter` that matches every legitimate user, and remove or
+In the search-then-bind modes, Tuwunel falls back to local password
+verification when the LDAP search returns no matches. To enforce LDAP-only
+login for everyone (apart from accounts that authenticate via SSO), pair LDAP
+with a restrictive `filter` that matches every legitimate user, and remove or
 invalidate local passwords for accounts that should no longer be able to log
-in directly. Alternatively, set `login_with_password = false` and rely on
+in directly. Direct-bind mode already has no fallback, so it enforces this on
+its own. Alternatively, set `login_with_password = false` and rely on
 [identity providers](providers.md) for non-LDAP users.

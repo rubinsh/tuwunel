@@ -5,16 +5,16 @@ use std::{
 	sync::{Arc, OnceLock},
 };
 
-use reqwest::{Certificate, Client, ClientBuilder, Proxy};
+use reqwest::{Client, ClientBuilder, Proxy};
 use sentry::{
-	Breadcrumb, ClientOptions, Level, Transport,
-	transports::ReqwestHttpTransport,
+	Breadcrumb, ClientOptions, Level, Transport, TransportOptions,
+	transports::ReqwestHttpTransportOptions,
 	types::{
 		Dsn,
 		protocol::v7::{Context, Event},
 	},
 };
-use tuwunel_core::{config::Config, debug, trace};
+use tuwunel_core::{config::Config, debug, error, error::error_chain, trace};
 
 static SEND_PANIC: OnceLock<bool> = OnceLock::new();
 static SEND_ERROR: OnceLock<bool> = OnceLock::new();
@@ -58,15 +58,7 @@ fn options(config: &Config) -> ClientOptions {
 	}
 }
 
-// Sentry's default reqwest transport builds a Client with no extra roots,
-// which fails on minimal images where `rustls-platform-verifier` finds an
-// empty system store. Mirror `service::client::base()` and merge webpki
-// roots so the verifier has at least one source of trust.
 fn build_transport(options: &ClientOptions) -> Arc<dyn Transport> {
-	let webpki = webpki_root_certs::TLS_SERVER_ROOT_CERTS
-		.iter()
-		.map(|der| Certificate::from_der(der).expect("certificate must be valid der encoding"));
-
 	let proxies = [
 		options
 			.http_proxy
@@ -78,18 +70,29 @@ fn build_transport(options: &ClientOptions) -> Arc<dyn Transport> {
 			.and_then(|url| Proxy::https(url.as_ref()).ok()),
 	];
 
-	let builder = Client::builder()
-		.tls_certs_merge(webpki)
-		.danger_accept_invalid_certs(options.accept_invalid_certs);
+	let builder = Client::builder().danger_accept_invalid_certs(options.accept_invalid_certs);
 
 	let client = proxies
 		.into_iter()
 		.flatten()
 		.fold(builder, ClientBuilder::proxy)
 		.build()
+		.inspect_err(|e| {
+			error!(
+				chain = %error_chain(e),
+				"Failed to build the sentry transport client",
+			);
+		})
 		.expect("reqwest client must build for sentry transport");
 
-	Arc::new(ReqwestHttpTransport::with_client(options, client))
+	let transport_options = TransportOptions::try_from_client_options(options)
+		.expect("sentry client options must have a DSN");
+
+	let transport = ReqwestHttpTransportOptions::from(transport_options)
+		.with_client(client)
+		.build();
+
+	Arc::new(transport)
 }
 
 fn before_send(event: Event<'static>) -> Option<Event<'static>> {

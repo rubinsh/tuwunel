@@ -3,7 +3,7 @@ use std::{sync::Arc, time::SystemTime};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
-	Err, Result,
+	Err, Result, err,
 	utils::{
 		self,
 		stream::{ReadyExt, TryIgnore},
@@ -16,7 +16,7 @@ pub(super) struct Data {
 }
 
 /// Metadata of a registration token.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DatabaseTokenInfo {
 	/// The number of times this token has been used to create an account.
 	pub uses: u64,
@@ -28,8 +28,9 @@ impl DatabaseTokenInfo {
 	pub(super) fn new(expires: TokenExpires) -> Self { Self { uses: 0, expires } }
 
 	/// Determine whether this token info represents a valid token, i.e. one
-	/// that has not expired according to its [`Self::expires`] property. If
-	/// [`Self::expires`] is [`None`], this function will always return `true`.
+	/// that has not exhausted its `max_uses` or passed its `max_age`. When
+	/// both `expires.max_uses` and `expires.max_age` are `None`, this always
+	/// returns `true`.
 	#[must_use]
 	pub fn is_valid(&self) -> bool {
 		if let Some(max_uses) = self.expires.max_uses
@@ -58,7 +59,7 @@ impl std::fmt::Display for DatabaseTokenInfo {
 	}
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct TokenExpires {
 	pub max_uses: Option<u64>,
 	pub max_age: Option<SystemTime>,
@@ -173,6 +174,31 @@ impl Data {
 			true
 		})
 		.unwrap_or(false)
+	}
+
+	/// Look up a token's stored metadata, returning `None` when it is absent.
+	pub(super) async fn get_token_info(&self, token: &str) -> Result<DatabaseTokenInfo> {
+		self.registrationtoken_info
+			.get(token)
+			.await
+			.deserialized()
+			.map_err(|_| err!(Request(NotFound("Registration token not found"))))
+	}
+
+	/// Replace a token's expiry while preserving its use counter.
+	pub(super) async fn update_token(
+		&self,
+		token: &str,
+		expires: TokenExpires,
+	) -> Result<DatabaseTokenInfo> {
+		let current = self.get_token_info(token).await?;
+
+		let info = DatabaseTokenInfo { uses: current.uses, expires };
+
+		self.registrationtoken_info
+			.raw_put(token, Json(&info));
+
+		Ok(info)
 	}
 
 	/// Iterate over all valid tokens and delete expired ones.

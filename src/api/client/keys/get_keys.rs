@@ -5,7 +5,7 @@ use futures::{
 	FutureExt, StreamExt,
 	future::{
 		Either::{Left, Right},
-		join, join4,
+		join, join5,
 	},
 };
 use ruma::{
@@ -168,8 +168,14 @@ where
 		.then_async(|| services.users.get_user_signing_key(user_id).ok())
 		.map(Option::flatten);
 
-	let (device_keys, master_key, self_signing_key, user_signing_key) =
-		join4(device_keys, master_key, self_signing_key, user_signing_key).await;
+	let appservice_keys = services
+		.appservice
+		.query_keys(user_id, device_ids);
+
+	let (mut device_keys, master_key, self_signing_key, user_signing_key, appservice_keys) =
+		join5(device_keys, master_key, self_signing_key, user_signing_key, appservice_keys).await;
+
+	device_keys.extend(appservice_keys);
 
 	let owned = || user_id.to_owned();
 	Keys {
@@ -259,21 +265,31 @@ where
 		.into_iter()
 		.stream()
 		.broad_then(async |(server, device_keys)| {
+			let failed = || Keys {
+				failures: BTreeMap::from([(server.to_string(), json!({}))]),
+				..Default::default()
+			};
+
 			let request = federation::keys::get_keys::v1::Request { device_keys };
 
-			(server, services.federation.execute(server, request).await)
-		})
-		.broad_then(async |(server, response)| match response {
-			| Ok(response) =>
-				process_federation_response(services, sender_user, allowed_signatures, response)
+			match services
+				.federation
+				.execute_keys(server, request)
+				.await
+			{
+				| Ok(response) =>
+					process_federation_response(
+						services,
+						sender_user,
+						allowed_signatures,
+						response,
+					)
 					.await,
-			| Err(e) => {
-				debug_warn!(%server, "key federation request failed: {e}");
-				Keys {
-					failures: BTreeMap::from([(server.to_string(), json!({}))]),
-					..Default::default()
-				}
-			},
+				| Err(e) => {
+					debug_warn!(%server, "key federation request failed: {e}");
+					failed()
+				},
+			}
 		})
 		.ready_fold(Keys::default(), Keys::merge)
 		.await

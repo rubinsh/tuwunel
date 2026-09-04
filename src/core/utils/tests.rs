@@ -1,4 +1,21 @@
-use crate::utils;
+use std::{
+	panic::{AssertUnwindSafe, catch_unwind},
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+	task::{Context, Waker},
+};
+
+use crate::{
+	Error, Result,
+	utils::{
+		self, MutexMap, math::usize_from_f64, two_phase_counter::Counter,
+		url::hostname_matches_domain,
+	},
+};
+
+type CounterCallback = Box<dyn Fn(u64) -> Result + Send + Sync>;
 
 #[test]
 fn increment_none() {
@@ -53,10 +70,33 @@ fn checked_add_overflow() {
 	assert_eq!(res, 0);
 }
 
+#[test]
+fn usize_from_f64_truncates() {
+	assert_eq!(usize_from_f64(42.75).unwrap(), 42);
+	assert_eq!(usize_from_f64(-0.0).unwrap(), 0);
+}
+
+#[test]
+fn usize_from_f64_rejects_invalid_values() {
+	for value in [-1.0, -0.25, f64::NEG_INFINITY, f64::NAN, f64::INFINITY] {
+		assert!(matches!(usize_from_f64(value), Err(Error::Arithmetic(_))), "accepted {value:?}");
+	}
+}
+
+#[test]
+fn usize_from_f64_enforces_exclusive_bound() {
+	let exponent = i32::try_from(usize::BITS).expect("usize width fits i32");
+	let bound = 2.0_f64.powi(exponent);
+	let spacing = 1_usize << usize::BITS.saturating_sub(f64::MANTISSA_DIGITS);
+	let preceding = usize::MAX - (spacing - 1);
+
+	assert_eq!(usize_from_f64(bound.next_down()).unwrap(), preceding);
+	assert!(matches!(usize_from_f64(bound), Err(Error::Arithmetic(_))));
+	assert!(matches!(usize_from_f64(bound.next_up()), Err(Error::Arithmetic(_))));
+}
+
 #[tokio::test]
 async fn mutex_map_cleanup() {
-	use crate::utils::MutexMap;
-
 	let map = MutexMap::<String, ()>::new();
 
 	let lock = map.lock("foo").await;
@@ -71,8 +111,6 @@ async fn mutex_map_contend() {
 	use std::sync::Arc;
 
 	use tokio::sync::Barrier;
-
-	use crate::utils::MutexMap;
 
 	let map = Arc::new(MutexMap::<String, ()>::new());
 	let seq = Arc::new([Barrier::new(2), Barrier::new(2)]);
@@ -104,6 +142,33 @@ async fn mutex_map_contend() {
 
 	tokio::try_join!(join_b, join_a).expect("joined");
 	assert!(map.is_empty(), "Must be empty");
+}
+
+#[tokio::test]
+async fn mutex_map_cancel() {
+	let map = MutexMap::<String, ()>::new();
+
+	let lock = map.lock("foo").await;
+	let mut contend = Box::pin(map.lock("foo"));
+	let mut cx = Context::from_waker(Waker::noop());
+
+	assert!(contend.as_mut().poll(&mut cx).is_pending(), "must contend");
+
+	drop(lock);
+	drop(contend);
+	assert!(map.is_empty(), "map must be empty");
+}
+
+#[tokio::test]
+async fn mutex_map_try_cleanup() {
+	let map = MutexMap::<String, ()>::new();
+
+	let lock = map.lock("foo").await;
+	assert!(map.try_lock("foo").is_err(), "must contend");
+	assert!(map.try_try_lock("foo").is_err(), "must contend");
+
+	drop(lock);
+	assert!(map.is_empty(), "map must be empty");
 }
 
 #[test]
@@ -257,7 +322,7 @@ async fn set_intersection_sorted_stream2() {
 	let r = intersection_sorted_stream2(a.iter().stream(), b.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.is_empty());
+	assert!(r.is_empty(), "{r:?}");
 
 	let a = ["aaa", "ccc", "eee", "ggg"];
 	let b = ["aaa", "bbb", "ccc", "ddd", "eee"];
@@ -289,7 +354,7 @@ async fn set_difference_sorted_stream2() {
 	let r = difference_sorted_stream2(b.iter().stream(), a.iter().stream())
 		.collect::<Vec<&str>>()
 		.await;
-	assert!(r.is_empty());
+	assert!(r.is_empty(), "{r:?}");
 
 	let a = ["aaa", "ccc", "xxx", "yyy"];
 	let b = ["hhh", "iii", "jjj", "zzz"];
@@ -321,4 +386,58 @@ fn page_size() {
 	println!("{val:?}");
 
 	assert!(val != 0, "page size was zero");
+}
+
+#[test]
+fn two_phase_counter_recovers_from_panicking_commit() {
+	let refuse = Arc::new(AtomicBool::new(false));
+	let refuse_in_commit = refuse.clone();
+	let commit: CounterCallback = Box::new(move |count| {
+		assert!(
+			!refuse_in_commit.load(Ordering::Relaxed),
+			"commit refused sequence number {count}"
+		);
+
+		Ok(())
+	});
+
+	let release: CounterCallback = Box::new(|_| Ok(()));
+	let counter = Counter::new(0, commit, release);
+	let first = counter.next().expect("first sequence number");
+
+	assert_eq!(*first, 1, "the first sequence number dispatched is one");
+	drop(first);
+
+	refuse.store(true, Ordering::Relaxed);
+	catch_unwind(AssertUnwindSafe(|| drop(counter.next())))
+		.expect_err("a panicking commit callback unwinds out of the counter");
+
+	refuse.store(false, Ordering::Relaxed);
+	let second = counter
+		.next()
+		.expect("the counter outlives a poisoned lock");
+
+	assert_eq!(*second, 2, "the failed dispatch consumed no sequence number");
+	assert_eq!(counter.current(), 1, "the retirement value trails the pending permit");
+}
+
+#[test]
+fn hostname_domain_matching_is_case_insensitive_and_label_bounded() {
+	for (hostname, domain, expected) in [
+		("example.com", "example.com", true),
+		("EXAMPLE.COM", ".example.com", true),
+		("sub.example.com", "example.com", true),
+		("sub.example.com", ".EXAMPLE.COM", true),
+		("notexample.com", "example.com", false),
+		("example.org", "example.com", false),
+		("example.com.", ".", true),
+		("example.com", ".", false),
+		("example.com", "", false),
+	] {
+		assert_eq!(
+			hostname_matches_domain(hostname, domain),
+			expected,
+			"hostname {hostname}, domain {domain}",
+		);
+	}
 }

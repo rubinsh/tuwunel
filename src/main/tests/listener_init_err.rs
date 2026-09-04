@@ -9,7 +9,7 @@ use tuwunel::{Args, Runtime, Server};
 use tuwunel_core::Err;
 
 #[test]
-#[should_panic = "I/O error: No such file or directory (os error 2)"]
+#[should_panic = "'unix_socket_path' directive in your configuration"]
 fn listener_init_err() {
 	with_settings!({
 		description => "Listener Initialization Err",

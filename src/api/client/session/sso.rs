@@ -3,18 +3,19 @@ mod uiaa;
 use std::{borrow::Cow, collections::BTreeMap, net::IpAddr, time::Duration};
 
 use axum::extract::State;
-use axum_extra::extract::cookie::{Cookie, SameSite};
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as b64};
-use futures::{FutureExt, StreamExt, TryFutureExt, future::try_join};
+use futures::{FutureExt, TryFutureExt, future::try_join};
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use ruma::{
-	Mxc, OwnedMxcUri, OwnedRoomId, OwnedUserId, ServerName, UserId,
+	Mxc, OwnedMxcUri, OwnedUserId, ServerName, UserId,
 	api::client::{
-		session::{sso_callback, sso_login, sso_login_with_provider},
+		session::{SsoRedirectAction, sso_callback, sso_login, sso_login_with_provider},
 		uiaa::AuthType,
 	},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use tuwunel_core::{
 	Err, Result, at,
 	config::IdentityProvider,
@@ -34,15 +35,17 @@ use tuwunel_core::{
 };
 use tuwunel_service::{
 	Services,
+	client::read_response_capped,
 	media::MXC_LENGTH,
 	oauth::{
-		CODE_VERIFIER_LENGTH, Provider, SESSION_ID_LENGTH, Session, UserInfo, unique_id_sub,
+		CODE_VERIFIER_LENGTH, Provider, SESSION_ID_LENGTH, Session, TokenResponse, UserInfo,
+		unique_id_sub,
 	},
 	users::{PASSWORD_SENTINEL, Register},
 };
 use url::Url;
 
-pub(crate) use self::uiaa::sso_fallback_route;
+pub(crate) use self::uiaa::{sso_complete_js_route, sso_css_route, sso_fallback_route};
 use super::TOKEN_LENGTH;
 use crate::{ClientIp, Ruma};
 
@@ -58,6 +61,8 @@ struct GrantQuery<'a> {
 	code_challenge_method: &'a str,
 	code_challenge: &'a str,
 	redirect_uri: Option<&'a str>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	prompt: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -69,6 +74,72 @@ struct GrantCookie<'a> {
 }
 
 static GRANT_SESSION_COOKIE: &str = "tuwunel_grant_session";
+
+/// Path attribute for the grant-session cookie. The set and removal cookies
+/// must use the same value: a cookie is only replaced (and thus removed) when
+/// its name, domain and path all match (RFC 6265 5.3), and a Set-Cookie
+/// without an explicit path defaults to the request-URI's directory.
+fn grant_session_cookie_path(callback_url: Option<&Url>) -> &str {
+	callback_url.map(Url::path).unwrap_or("/")
+}
+
+fn decode_apple_userinfo_from_id_token(session: &Session) -> Result<UserInfo> {
+	let id_token = session.id_token.as_deref().ok_or_else(|| {
+		err!(Request(Unauthorized("Missing Apple id_token in token response.")))
+	})?;
+
+	let payload_b64 = id_token
+		.split('.')
+		.nth(1)
+		.ok_or_else(|| err!(Request(Unauthorized("Apple id_token is malformed."))))?;
+
+	let payload = b64
+		.decode(payload_b64)
+		.map_err(|_| err!(Request(Unauthorized("Apple id_token payload is invalid base64."))))?;
+
+	let payload: JsonValue = serde_json::from_slice(&payload)
+		.map_err(|_| err!(Request(Unauthorized("Apple id_token payload is not valid JSON."))))?;
+
+	let sub = payload
+		.get("sub")
+		.and_then(JsonValue::as_str)
+		.ok_or_else(|| {
+			err!(Request(Unauthorized("Apple id_token missing required sub claim.")))
+		})?;
+
+	let email = payload
+		.get("email")
+		.and_then(JsonValue::as_str)
+		.map(ToOwned::to_owned);
+
+	let preferred_username = email
+		.as_deref()
+		.and_then(|value| value.split_once('@'))
+		.map(at!(0))
+		.map(ToOwned::to_owned);
+
+	Ok(UserInfo {
+		sub: sub.to_owned(),
+		preferred_username: preferred_username.clone(),
+		username: preferred_username,
+		nickname: None,
+		name: payload
+			.get("name")
+			.and_then(JsonValue::as_str)
+			.map(ToOwned::to_owned),
+		given_name: payload
+			.get("given_name")
+			.and_then(JsonValue::as_str)
+			.map(ToOwned::to_owned),
+		family_name: payload
+			.get("family_name")
+			.and_then(JsonValue::as_str)
+			.map(ToOwned::to_owned),
+		email,
+		avatar_url: None,
+		picture: None,
+	})
+}
 
 /// # `GET /_matrix/client/v3/login/sso/redirect`
 ///
@@ -93,13 +164,14 @@ pub(crate) async fn sso_login_route(
 	}
 
 	let redirect_url = body.body.redirect_url;
+	let action = body.body.action;
 	let default_idp_id = services
 		.oauth
 		.providers
 		.get_default_id()
 		.unwrap_or_default();
 
-	handle_sso_login(&services, &client, default_idp_id, redirect_url, None)
+	handle_sso_login(&services, &client, default_idp_id, redirect_url, None, action)
 		.map_ok(|response| sso_login::v3::Response {
 			location: response.location,
 			cookie: response.cookie,
@@ -130,8 +202,9 @@ pub(crate) async fn sso_login_with_provider_route(
 	let idp_id = body.body.idp_id;
 	let redirect_url = body.body.redirect_url;
 	let login_token = body.body.login_token;
+	let action = body.body.action;
 
-	handle_sso_login(&services, &client, idp_id, redirect_url, login_token).await
+	handle_sso_login(&services, &client, idp_id, redirect_url, login_token, action).await
 }
 
 async fn handle_sso_login(
@@ -140,6 +213,7 @@ async fn handle_sso_login(
 	idp_id: String,
 	redirect_url: String,
 	login_token: Option<String>,
+	action: Option<SsoRedirectAction>,
 ) -> Result<sso_login_with_provider::v3::Response> {
 	let redirect_url: Url = redirect_url.parse().map_err(|e| {
 		err!(Request(InvalidParam(debug_warn!(
@@ -157,6 +231,9 @@ async fn handle_sso_login(
 	let code_challenge = b64.encode(sha256::hash(code_verifier.as_bytes()));
 	let callback_uri = provider.callback_url.as_ref().map(Url::as_str);
 	let scope = provider.scope.iter().join(" ");
+	let prompt = action
+		.filter(|_| provider.forward_action_prompt)
+		.and_then(|action| matches!(action, SsoRedirectAction::Register).then_some("create"));
 
 	let query = GrantQuery {
 		client_id: &provider.client_id,
@@ -167,6 +244,7 @@ async fn handle_sso_login(
 		code_challenge_method: "S256",
 		code_challenge: &code_challenge,
 		redirect_uri: callback_uri,
+		prompt,
 		scope: scope
 			.is_empty()
 			.then_some("openid email profile")
@@ -180,13 +258,18 @@ async fn handle_sso_login(
 			let query = serde_html_form::to_string(&query).ok();
 			location.set_query(query.as_deref());
 			if !provider.extra_authorization_parameters.is_empty() {
-				// Overlay extra_authorization_parameters onto the base query, overriding
-				// duplicate keys.
-				let merged: BTreeMap<String, String> = location
-					.query_pairs()
-					.map(|(k, v)| (k.into_owned(), v.into_owned()))
-					.chain(provider.extra_authorization_parameters.clone())
+				// Base wins on key collision so extras cannot disable CSRF/PKCE.
+				let merged: BTreeMap<String, String> = provider
+					.extra_authorization_parameters
+					.clone()
+					.into_iter()
+					.chain(
+						location
+							.query_pairs()
+							.map(|(k, v)| (k.into_owned(), v.into_owned())),
+					)
 					.collect();
+
 				location.set_query(None);
 				location.query_pairs_mut().extend_pairs(&merged);
 			}
@@ -203,11 +286,7 @@ async fn handle_sso_login(
 		redirect_uri: redirect_url.as_str().into(),
 	};
 
-	let cookie_path = provider
-		.callback_url
-		.as_ref()
-		.map(Url::path)
-		.unwrap_or("/");
+	let cookie_path = grant_session_cookie_path(provider.callback_url.as_ref());
 
 	let cookie_max_age = provider
 		.grant_session_duration
@@ -295,7 +374,6 @@ pub(crate) async fn sso_callback_route(
 		.get(body.body.idp_id.as_str());
 
 	let (provider, session) = try_join(provider, session).await.log_err()?;
-	let client_id = &provider.client_id;
 	let idp_id = provider.id();
 
 	if session.sess_id.as_deref() != Some(sess_id) {
@@ -310,118 +388,88 @@ pub(crate) async fn sso_callback_route(
 
 	if session
 		.authorize_expires_at
-		.map(timepoint_has_passed)
-		.unwrap_or(false)
+		.is_some_and(timepoint_has_passed)
 	{
 		return Err!(Request(Unauthorized("Authorization grant session has expired.")));
 	}
 
 	if provider.check_cookie {
-		let cookie = body
-			.cookie
-			.get(GRANT_SESSION_COOKIE)
-			.map(Cookie::value)
-			.map(serde_html_form::from_str::<GrantCookie<'_>>)
-			.transpose()?
-			.ok_or_else(|| {
-				err!(Request(Unauthorized("Missing cookie {GRANT_SESSION_COOKIE:?}")))
-			})?;
-
-		if cookie.client_id.as_ref() != client_id.as_str() {
-			return Err!(Request(Unauthorized("Client ID {client_id:?} cookie mismatch.")));
-		}
-
-		if Some(cookie.nonce.as_ref()) != session.cookie_nonce.as_deref() {
-			return Err!(Request(Unauthorized("Cookie nonce does not match session state.")));
-		}
-
-		if cookie.state.as_ref() != sess_id {
-			return Err!(Request(Unauthorized("Session ID {sess_id:?} cookie mismatch.")));
-		}
+		validate_session_cookie(&body.cookie, &provider, &session, sess_id)?;
 	}
 
-	// Request access token.
 	let token_response = services
 		.oauth
 		.request_token((&provider, &session), code)
 		.await?;
 
-	let token_expires_at = token_response
-		.expires_in
-		.map(Duration::from_secs)
-		.map(timepoint_from_now)
-		.transpose()?;
+	let session = apply_token_response(session, token_response)?;
 
-	let refresh_token_expires_at = token_response
-		.refresh_token_expires_in
-		.map(Duration::from_secs)
-		.map(timepoint_from_now)
-		.transpose()?;
-
-	// Update the session with access token results
-	let session = Session {
-		scope: token_response.scope,
-		token_type: token_response.token_type,
-		access_token: token_response.access_token,
-		expires_at: token_expires_at,
-		refresh_token: token_response.refresh_token,
-		refresh_token_expires_at,
-		..session
-	};
-
-	// Request userinfo claims.
 	let userinfo = services
 		.oauth
 		.request_userinfo((&provider, &session))
-		.await?;
+		.await
+		.or_else(|error| {
+			if provider.brand != "appleoidc" {
+				return Err(error);
+			}
+
+			debug_warn!(
+				?error,
+				idp_id = provider.id(),
+				"Failed to fetch Apple userinfo endpoint; falling back to id_token claims.",
+			);
+
+			decode_apple_userinfo_from_id_token(&session).map_err(|decode_error| {
+				debug_warn!(
+					?decode_error,
+					idp_id = provider.id(),
+					"Failed to decode Apple id_token fallback.",
+				);
+				error
+			})
+		})?;
 
 	let unique_id = unique_id_sub((&provider, &userinfo.sub))?;
 
-	// Check for an existing session from this identity. We want to maintain one
-	// session for each identity and keep the newer one which has up-to-date state
-	// and access.
-	let (old_user_id, old_sess_id) = match services
-		.oauth
-		.sessions
-		.get_by_unique_id(&unique_id)
-		.await
-	{
-		| Ok(session) => (session.user_id, session.sess_id),
-		| Err(error) if !error.is_not_found() => return Err(error),
-		| Err(_) => (None, None),
-	};
+	let complete_identity = async |old_user_id: Option<OwnedUserId>| {
+		let session = Session {
+			user_info: Some(userinfo.clone()),
+			..session
+		};
 
-	// Update the session with userinfo
-	let session = Session {
-		user_info: Some(userinfo.clone()),
-		..session
-	};
+		let user_id = match (session.user_id, old_user_id) {
+			| (Some(user_id), ..) | (None, Some(user_id)) => user_id,
+			| (None, None) => decide_user_id(&services, &provider, &userinfo, &unique_id).await?,
+		};
 
-	// Keep the user_id from the old session as best as possible.
-	let user_id = match (session.user_id, old_user_id) {
-		| (Some(user_id), ..) | (None, Some(user_id)) => user_id,
-		| (None, None) => decide_user_id(&services, &provider, &userinfo, &unique_id).await?,
-	};
+		let session = Session {
+			user_id: Some(user_id.clone()),
+			..session
+		};
 
-	// Update the session with user_id
-	let session = Session {
-		user_id: Some(user_id.clone()),
-		..session
-	};
+		if !services.users.exists(&user_id).await {
+			let origin = match provider.registration {
+				| true => "sso",
+				// Present in LDAP is an existing user to provision, not a new registration.
+				| false if ldap_user_exists(&services, &user_id).await => "ldap",
+				| false =>
+					return Err!(Request(Forbidden(
+						"Registration from this provider is disabled"
+					))),
+			};
 
-	// Attempt to register a non-existing user.
-	if !services.users.exists(&user_id).await {
-		if !provider.registration {
-			return Err!(Request(Forbidden("Registration from this provider is disabled")));
+			register_user(&services, &provider, &session, &userinfo, &user_id, origin).await?;
 		}
 
-		register_user(&services, &provider, &session, &userinfo, &user_id).await?;
-	}
+		Ok((session, user_id))
+	};
 
-	// Commit the updated session.
-	services.oauth.sessions.put(&session).await;
+	let (session, user_id, old_sess_id) = services
+		.oauth
+		.sessions
+		.commit_identity_session(&unique_id, complete_identity)
+		.await?;
 
-	// Delete any old session.
 	if let Some(old_sess_id) = old_sess_id
 		.as_deref()
 		.filter(is_not_equal_to!(&sess_id))
@@ -434,12 +482,12 @@ pub(crate) async fn sso_callback_route(
 	}
 
 	let cookie = Cookie::build((GRANT_SESSION_COOKIE, EMPTY))
+		.path(grant_session_cookie_path(provider.callback_url.as_ref()))
 		.removal()
 		.build()
 		.to_string()
 		.into();
 
-	// Decide if this is a UIAA authentication and take the UIAA branch if so.
 	if let Some(redirect_url) = session
 		.redirect_url
 		.as_ref()
@@ -448,8 +496,74 @@ pub(crate) async fn sso_callback_route(
 		return handle_uiaa(&services, &user_id, cookie, redirect_url).await;
 	}
 
-	// Decide the next provider to chain after this one.
-	let next_idp_url = services
+	let next_idp_url = chain_next_idp_url(&services, &provider, &session, idp_id);
+
+	let location = finalize_login_redirect(&services, &session, next_idp_url, &user_id)?;
+
+	Ok(sso_callback::unstable::Response { location, cookie: Some(cookie) })
+}
+
+fn validate_session_cookie(
+	cookies: &CookieJar,
+	provider: &Provider,
+	session: &Session,
+	sess_id: &str,
+) -> Result {
+	let client_id = &provider.client_id;
+	let cookie = cookies
+		.get(GRANT_SESSION_COOKIE)
+		.map(Cookie::value)
+		.map(serde_html_form::from_str::<GrantCookie<'_>>)
+		.transpose()?
+		.ok_or_else(|| err!(Request(Unauthorized("Missing cookie {GRANT_SESSION_COOKIE:?}"))))?;
+
+	if cookie.client_id.as_ref() != client_id.as_str() {
+		return Err!(Request(Unauthorized("Client ID {client_id:?} cookie mismatch.")));
+	}
+
+	if Some(cookie.nonce.as_ref()) != session.cookie_nonce.as_deref() {
+		return Err!(Request(Unauthorized("Cookie nonce does not match session state.")));
+	}
+
+	if cookie.state.as_ref() != sess_id {
+		return Err!(Request(Unauthorized("Session ID {sess_id:?} cookie mismatch.")));
+	}
+
+	Ok(())
+}
+
+fn apply_token_response(session: Session, token: TokenResponse) -> Result<Session> {
+	let expires_at = token
+		.expires_in
+		.map(Duration::from_secs)
+		.map(timepoint_from_now)
+		.transpose()?;
+
+	let refresh_token_expires_at = token
+		.refresh_token_expires_in
+		.map(Duration::from_secs)
+		.map(timepoint_from_now)
+		.transpose()?;
+
+	Ok(Session {
+		scope: token.scope,
+		token_type: token.token_type,
+		access_token: token.access_token,
+		id_token: token.id_token,
+		expires_at,
+		refresh_token: token.refresh_token,
+		refresh_token_expires_at,
+		..session
+	})
+}
+
+fn chain_next_idp_url(
+	services: &Services,
+	provider: &Provider,
+	session: &Session,
+	idp_id: &str,
+) -> Option<Url> {
+	services
 		.config
 		.identity_provider
 		.values()
@@ -469,25 +583,29 @@ pub(crate) async fn sso_callback_route(
 
 				url
 			})
-		});
+		})
+}
 
-	// Allow the user to login to Matrix.
+fn finalize_login_redirect(
+	services: &Services,
+	session: &Session,
+	next_idp_url: Option<Url>,
+	user_id: &UserId,
+) -> Result<String> {
 	let login_token = utils::random_string(TOKEN_LENGTH);
 	let _login_token_expires_in = services
 		.users
-		.create_login_token(&user_id, &login_token);
+		.create_login_token(user_id, &login_token);
 
 	let location = next_idp_url
-		.or(session.redirect_url)
-		.as_ref()
+		.or_else(|| session.redirect_url.clone())
 		.ok_or_else(|| err!(Request(InvalidParam("Missing redirect URL in session data"))))?
-		.clone()
 		.query_pairs_mut()
 		.append_pair("loginToken", &login_token)
 		.finish()
 		.to_string();
 
-	Ok(sso_callback::unstable::Response { location, cookie: Some(cookie) })
+	Ok(location)
 }
 
 async fn handle_uiaa(
@@ -544,6 +662,17 @@ async fn handle_uiaa(
 	Ok(sso_callback::unstable::Response { location, cookie: Some(cookie) })
 }
 
+async fn ldap_user_exists(services: &Services, user_id: &UserId) -> bool {
+	cfg!(feature = "ldap")
+		&& services.config.ldap.enable
+		&& services
+			.users
+			.search_ldap(user_id)
+			.await
+			.log_err()
+			.is_ok_and(|dns| !dns.is_empty())
+}
+
 #[tracing::instrument(
 	name = "register",
 	level = INFO_SPAN_LEVEL,
@@ -556,6 +685,7 @@ async fn register_user(
 	session: &Session,
 	userinfo: &UserInfo,
 	user_id: &UserId,
+	origin: &str,
 ) -> Result {
 	debug_info!(%user_id, "Creating new user account...");
 
@@ -564,7 +694,7 @@ async fn register_user(
 		.full_register(Register {
 			user_id: Some(user_id),
 			password: Some(PASSWORD_SENTINEL),
-			origin: Some("sso"),
+			origin: Some(origin),
 			displayname: userinfo.name.as_deref(),
 			grant_first_user_admin: true,
 			..Default::default()
@@ -592,9 +722,7 @@ async fn register_user(
 		format!("New user \"{user_id}\" registered on this server via {idp_name} ({idp_id})");
 
 	info!("{notice}");
-	if services.server.config.admin_room_notices {
-		services.admin.notice(&notice).await;
-	}
+	services.admin.notify(&notice).await;
 
 	Ok(())
 }
@@ -631,24 +759,18 @@ async fn set_avatar(
 	};
 
 	let content_disposition = make_content_disposition(None, content_type.as_deref(), None);
-	let bytes = response.bytes().await?;
+	let limit = services.server.config.max_response_size;
+	let bytes = read_response_capped(response, limit).await?;
 	services
 		.media
 		.create(&mxc, Some(user_id), Some(&content_disposition), content_type.as_deref(), &bytes)
 		.await?;
 
-	let all_joined_rooms: Vec<OwnedRoomId> = services
-		.state_cache
-		.rooms_joined(user_id)
-		.map(ToOwned::to_owned)
-		.collect()
-		.await;
-
 	let mxc_uri: OwnedMxcUri = mxc.to_string().into();
 	services
-		.users
-		.update_avatar_url(user_id, Some(&mxc_uri), None, &all_joined_rooms)
-		.await;
+		.profile
+		.set_avatar_url(user_id, Some(&mxc_uri), None)
+		.await?;
 
 	Ok(())
 }
@@ -804,5 +926,120 @@ fn parse_user_id(server_name: &ServerName, username: &str) -> Result<OwnedUserId
 				"Username {username} contains disallowed characters or spaces: {e}"
 			)))),
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::json;
+
+	use super::*;
+
+	fn apple_session_with_claims(claims: &serde_json::Value) -> Session {
+		let payload = b64.encode(serde_json::to_vec(claims).expect("serialize claims"));
+
+		Session {
+			id_token: Some(format!("header.{payload}.signature")),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn decode_apple_userinfo_from_id_token_extracts_expected_claims() {
+		let session = apple_session_with_claims(&json!({
+			"sub": "apple-user-123",
+			"email": "alice@example.com",
+			"name": "Alice Example",
+			"given_name": "Alice",
+			"family_name": "Example"
+		}));
+
+		let userinfo =
+			decode_apple_userinfo_from_id_token(&session).expect("decode Apple id_token claims");
+
+		assert_eq!(userinfo.sub, "apple-user-123");
+		assert_eq!(userinfo.email.as_deref(), Some("alice@example.com"));
+		assert_eq!(userinfo.preferred_username.as_deref(), Some("alice"));
+		assert_eq!(userinfo.username.as_deref(), Some("alice"));
+		assert_eq!(userinfo.name.as_deref(), Some("Alice Example"));
+		assert_eq!(userinfo.given_name.as_deref(), Some("Alice"));
+		assert_eq!(userinfo.family_name.as_deref(), Some("Example"));
+	}
+
+	#[test]
+	fn decode_apple_userinfo_from_id_token_requires_sub_claim() {
+		let session = apple_session_with_claims(&json!({
+			"email": "alice@example.com"
+		}));
+
+		let error = decode_apple_userinfo_from_id_token(&session)
+			.expect_err("missing sub claim should fail");
+
+		let message = format!("{error}");
+		assert!(message.contains("sub claim"), "unexpected error: {message}");
+	}
+
+	#[test]
+	fn decode_apple_userinfo_from_id_token_requires_id_token() {
+		let session = Session::default();
+
+		let error = decode_apple_userinfo_from_id_token(&session)
+			.expect_err("missing id_token should fail");
+
+		let message = format!("{error}");
+		assert!(message.contains("Missing Apple id_token"), "unexpected error: {message}");
+	}
+
+	#[test]
+	fn decode_apple_userinfo_from_id_token_rejects_invalid_payload() {
+		let session = Session {
+			id_token: Some("header.!.signature".to_owned()),
+			..Default::default()
+		};
+
+		let error = decode_apple_userinfo_from_id_token(&session)
+			.expect_err("invalid id_token payload should fail");
+
+		let message = format!("{error}");
+		assert!(message.contains("invalid base64"), "unexpected error: {message}");
+	}
+
+	#[test]
+	fn grant_session_cookie_path_uses_the_callback_path() {
+		let callback = Url::parse(
+			"https://matrix.example/_matrix/client/unstable/login/sso/callback/tuwunel_abc",
+		)
+		.expect("valid URL");
+
+		assert_eq!(
+			grant_session_cookie_path(Some(&callback)),
+			"/_matrix/client/unstable/login/sso/callback/tuwunel_abc"
+		);
+		assert_eq!(grant_session_cookie_path(None), "/");
+	}
+
+	#[test]
+	fn grant_session_removal_cookie_path_matches_the_set_cookie_path() {
+		let callback = Url::parse(
+			"https://matrix.example/_matrix/client/unstable/login/sso/callback/tuwunel_abc",
+		)
+		.expect("valid URL");
+
+		let set = Cookie::build((GRANT_SESSION_COOKIE, "grant"))
+			.path(grant_session_cookie_path(Some(&callback)))
+			.build();
+
+		let removal = Cookie::build((GRANT_SESSION_COOKIE, EMPTY))
+			.path(grant_session_cookie_path(Some(&callback)))
+			.removal()
+			.build();
+
+		assert_eq!(set.path(), removal.path());
+		assert!(
+			removal
+				.to_string()
+				.contains("Path=/_matrix/client/unstable/login/sso/callback/tuwunel_abc"),
+			"unexpected removal cookie: {removal}"
+		);
 	}
 }

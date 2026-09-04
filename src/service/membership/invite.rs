@@ -1,7 +1,10 @@
 use futures::FutureExt;
 use ruma::{
 	OwnedServerName, RoomId, UserId,
-	api::federation::membership::create_invite,
+	api::{
+		error::ErrorKind,
+		federation::membership::{RawStrippedState, create_invite},
+	},
 	events::room::member::{MembershipState, RoomMemberEventContent},
 };
 use tuwunel_core::{
@@ -47,21 +50,19 @@ async fn remote_invite(
 	reason: Option<&String>,
 	is_direct: bool,
 ) -> Result {
-	let (pdu, pdu_json, invite_room_state) = {
+	let (pdu, pdu_json, invite_room_state, room_version_id) = {
 		let state_lock = self.services.state.mutex.lock(room_id).await;
 
-		let content = RoomMemberEventContent {
-			displayname: self
-				.services
-				.users
-				.displayname(user_id)
-				.await
-				.ok(),
-			avatar_url: self.services.users.avatar_url(user_id).await.ok(),
-			is_direct: Some(is_direct),
+		let mut content = RoomMemberEventContent {
+			is_direct,
 			reason: reason.cloned(),
 			..RoomMemberEventContent::new(MembershipState::Invite)
 		};
+
+		self.services
+			.profile
+			.fill_profile_data(user_id, &mut content)
+			.await;
 
 		let (pdu, pdu_json) = self
 			.services
@@ -74,18 +75,22 @@ async fn remote_invite(
 			)
 			.await?;
 
-		let invite_room_state = self.services.state.summary_stripped(&pdu).await;
+		let room_version_id = self
+			.services
+			.state
+			.get_room_version(room_id)
+			.await?;
+
+		let invite_room_state = self
+			.services
+			.state
+			.summary_pdus(&pdu, &pdu_json, &room_version_id)
+			.await;
 
 		drop(state_lock);
 
-		(pdu, pdu_json, invite_room_state)
+		(pdu, pdu_json, invite_room_state, room_version_id)
 	};
-
-	let room_version_id = self
-		.services
-		.state
-		.get_room_version(room_id)
-		.await?;
 
 	let response = self
 		.services
@@ -101,7 +106,7 @@ async fn remote_invite(
 				.await,
 			invite_room_state: invite_room_state
 				.into_iter()
-				.map(Into::into)
+				.map(RawStrippedState::Pdu)
 				.collect(),
 			via: self
 				.services
@@ -110,7 +115,20 @@ async fn remote_invite(
 				.await
 				.ok(),
 		})
-		.await?;
+		.await
+		.map_err(|e| match e.kind() {
+			| ErrorKind::IncompatibleRoomVersion { .. } | ErrorKind::UnsupportedRoomVersion =>
+				err!(Request(UnsupportedRoomVersion(
+					"Server {} does not support room version {room_version_id}.",
+					user_id.server_name(),
+				))),
+			// MSC4311: the remote rejected our well-formed invite over create-event
+			// validation; the client cannot make it succeed, so surface a 5xx.
+			| ErrorKind::MissingParam => err!(BadServerResponse(
+				"Remote server could not validate the invite's create event."
+			)),
+			| _ => e,
+		})?;
 
 	// We do not add the event_id field to the pdu here because of signature and
 	// hashes checks
@@ -181,19 +199,16 @@ async fn local_invite(
 
 	let state_lock = self.services.state.mutex.lock(room_id).await;
 
-	let content = RoomMemberEventContent {
-		displayname: self
-			.services
-			.users
-			.displayname(user_id)
-			.await
-			.ok(),
-		avatar_url: self.services.users.avatar_url(user_id).await.ok(),
-		blurhash: self.services.users.blurhash(user_id).await.ok(),
-		is_direct: Some(is_direct),
+	let mut content = RoomMemberEventContent {
+		is_direct,
 		reason: reason.cloned(),
 		..RoomMemberEventContent::new(MembershipState::Invite)
 	};
+
+	self.services
+		.profile
+		.fill_profile_data(user_id, &mut content)
+		.await;
 
 	self.services
 		.timeline

@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use tuwunel_core::{
-	Server, at, debug,
+	Config, Server, at, debug,
 	debug::INFO_SPAN_LEVEL,
 	debug_info, debug_warn, expected, info, is_equal_to,
 	utils::{
@@ -12,7 +12,8 @@ use tuwunel_core::{
 		stream::{AMPLIFICATION_LIMIT, WIDTH_LIMIT},
 		sys::{
 			compute::{available_parallelism, cores_available, is_core_available},
-			max_threads, storage,
+			max_threads,
+			storage::{self, MultiDevice},
 		},
 	},
 };
@@ -48,15 +49,11 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 	let config = &server.config;
 	let num_cores = available_parallelism();
 
-	// Determine the maximum number of cores. The total number of cores available to
-	// the process may be less on systems with sparse core assignments, but this
-	// still serves as an upper-bound.
 	let cores_max = cores_available()
 		.last()
 		.unwrap_or(0)
 		.saturating_add(1);
 
-	// This finds the block device and gathers all the properties we need.
 	let path: PathBuf = config.database_path.clone();
 	let device_name = storage::name_from_path(&path)
 		.log_debug_err()
@@ -66,33 +63,90 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 	let topology_detected = devices.md.is_empty().is_false();
 	debug!(?topology_detected, ?device_name, ?devices);
 
-	// The default worker count is masked-on if we didn't find better information.
 	let default_worker_count = topology_detected
 		.is_false()
 		.then_some(config.db_pool_workers)
 		.map(|workers| workers.saturating_mul(num_cores));
 
-	// Sum the total number of possible tags. When no hardware detected this will
-	// default to the default_worker_count. Note well that the thread-worker model
-	// we use will never approach actual NVMe capacity as with io_uring or even
-	// close to userspace drivers. We still take some cues from this value which
-	// does give us actual request capacity.
-	let total_tags = devices
+	let total_tags = sum_total_tags(&devices, default_worker_count);
+	let topology = compute_topology(&devices, topology_detected, cores_max);
+	let max_workers =
+		compute_max_workers(&devices, default_worker_count, config.db_pool_max_workers);
+
+	let chan_limit = expected!(max_workers / num_cores)
+		.saturating_sub(8)
+		.saturating_add(1)
+		.next_multiple_of(8);
+
+	let workers =
+		compute_workers(&devices, config, default_worker_count, topology.len(), chan_limit);
+
+	let queues: Vec<usize> = workers
+		.iter()
+		.map(|count| {
+			count
+				.saturating_mul(config.db_pool_queue_mult)
+				.min(QUEUE_LIMIT.1)
+		})
+		.collect();
+
+	let total_workers = workers.iter().sum::<usize>();
+	let total_capacity = queues.iter().sum::<usize>();
+	let num_queues = queues.iter().filter(|&&cap| cap > 0).count();
+
+	if config.stream_width_scale > 0.0 {
+		update_stream_width(server, num_queues, total_workers, total_capacity);
+	}
+
+	log_topology(
+		topology_detected,
+		device_name.as_deref(),
+		num_cores,
+		&topology,
+		&workers,
+		&queues,
+		num_queues,
+		total_workers,
+		total_tags,
+		total_capacity,
+	);
+
+	assert!(total_workers > 0, "some workers expected");
+	debug_assert!(
+		total_workers <= max_workers || !topology_detected,
+		"spawning too many workers"
+	);
+
+	assert!(!queues.is_empty(), "some queues expected");
+	assert!(!queues.iter().copied().all(is_equal_to!(0)), "positive queue capacity expected");
+
+	(topology, workers, queues)
+}
+
+/// Sum the total number of possible tags. Without hardware detection this
+/// reduces to the default worker count. The thread-worker model never
+/// approaches actual NVMe capacity, but the value still informs request
+/// capacity downstream.
+fn sum_total_tags(devices: &MultiDevice, default_worker_count: Option<usize>) -> usize {
+	devices
 		.md
 		.iter()
 		.flat_map(|md| md.mq.iter())
 		.filter(|mq| mq.cpu_list.iter().copied().any(is_core_available))
 		.filter_map(|mq| mq.nr_tags)
 		.chain(default_worker_count)
-		.fold(0_usize, usize::saturating_add);
+		.fold(0_usize, usize::saturating_add)
+}
 
-	// Determine the CPU affinities of each hardware queue. Each indice is a core
-	// and each value is the associated hardware queue. On systems which share
-	// queues between cores some values will be repeated; on systems with multiple
-	// queues per core the affinities are assumed to match and we don't require a
-	// vector of vectors. Sparse unavailable cores default to 0. Undetected hardware
-	// defaults to the core identity as a best-guess.
-	let topology: Vec<usize> = devices
+/// Map cores to their associated hardware queue. Shared queues repeat across
+/// cores; sparse unavailable cores default to 0; undetected hardware falls back
+/// to the core identity as a best-guess maintaining core locality.
+fn compute_topology(
+	devices: &MultiDevice,
+	topology_detected: bool,
+	cores_max: usize,
+) -> Vec<usize> {
+	devices
 		.md
 		.iter()
 		.flat_map(|md| md.mq.iter())
@@ -114,52 +168,57 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 				.then_some(queue_id)
 				.unwrap_or(core_id)
 		})
-		.collect();
+		.collect()
+}
 
-	// Query getrlimit(2) to impose any additional restriction, divide to leave room
-	// for other threads in the process.
+/// Determine an ideal max worker count based on true capacity. The true value
+/// is rarely attainable in a thread-worker model so the result is clamped by
+/// both the rlimit-derived budget and the static `WORKER_LIMIT` range.
+fn compute_max_workers(
+	devices: &MultiDevice,
+	default_worker_count: Option<usize>,
+	max_workers_cfg: usize,
+) -> usize {
 	let max_threads = max_threads()
 		.map(at!(0))
 		.unwrap_or(usize::MAX)
 		.saturating_div(3);
 
-	// Determine an ideal max worker count based on true capacity. As stated prior
-	// the true value is rarely attainable in any thread-worker model, and clamped.
-	let max_workers = devices
+	devices
 		.md
 		.iter()
 		.flat_map(|md| md.mq.iter())
 		.filter_map(|mq| mq.nr_tags)
-		.chain(default_worker_count.into_iter())
+		.chain(default_worker_count)
 		.fold(0_usize, usize::saturating_add)
-		.min(config.db_pool_max_workers)
+		.min(max_workers_cfg)
 		.clamp(WORKER_LIMIT.0, max_threads)
-		.clamp(WORKER_LIMIT.0, WORKER_LIMIT.1);
+		.clamp(WORKER_LIMIT.0, WORKER_LIMIT.1)
+}
 
-	// Tamper for the total number of workers by reducing the count for each group.
-	let chan_limit = expected!(max_workers / num_cores)
-		.saturating_sub(8)
-		.saturating_add(1)
-		.next_multiple_of(8);
-
-	// Default workers vector without detection.
+/// Determine the worker groupings. Each indice represents a hardware queue and
+/// contains the number of workers which will service it. The vector is
+/// truncated to the number of cores on systems with multiple hardware queues
+/// per core, and the per-pool count is capped well below NVMe capacity.
+fn compute_workers(
+	devices: &MultiDevice,
+	config: &Config,
+	default_worker_count: Option<usize>,
+	topology_len: usize,
+	chan_limit: usize,
+) -> Vec<usize> {
 	let default_workers = default_worker_count
 		.into_iter()
 		.cycle()
 		.enumerate()
-		.map(|(core_id, count)| {
+		.map(move |(core_id, count)| {
 			is_core_available(core_id)
 				.then_some(count)
 				.unwrap_or(0)
 				.min(chan_limit)
 		});
 
-	// Determine the worker groupings. Each indice represents a hardware queue and
-	// contains the number of workers which will service it. This vector is
-	// truncated to the number of cores on systems which have multiple hardware
-	// queues per core. The number of workers is then truncated to a maximum for
-	// each pool; as stated prior, this will usually be less than NVMe capacity.
-	let workers: Vec<usize> = devices
+	devices
 		.md
 		.iter()
 		.inspect(|md| debug!(?md))
@@ -198,39 +257,27 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 			tags
 		})
 		.chain(default_workers)
-		.take(topology.len())
-		.collect();
+		.take(topology_len)
+		.collect()
+}
 
-	// Determine our software queue size for each hardware queue. This is the mpmc
-	// between the tokio worker and the pool worker.
-	let queues: Vec<usize> = workers
-		.iter()
-		.map(|count| {
-			count
-				.saturating_mul(config.db_pool_queue_mult)
-				.min(QUEUE_LIMIT.1)
-		})
-		.collect();
-
-	// Total number of workers to spawn.
-	let total_workers = workers.iter().sum::<usize>();
-
-	// Total capacity of all software queues.
-	let total_capacity = queues.iter().sum::<usize>();
-
-	// Discount queues with zero capacity for a proper denominator.
-	let num_queues = queues.iter().filter(|&&cap| cap > 0).count();
-
-	// After computing all of the above we can update the global automatic stream
-	// width, hopefully with a better value tailored to this system.
-	if config.stream_width_scale > 0.0 {
-		update_stream_width(server, num_queues, total_workers, total_capacity);
-	}
-
+#[expect(clippy::too_many_arguments)]
+fn log_topology(
+	topology_detected: bool,
+	device_name: Option<&str>,
+	num_cores: usize,
+	topology: &[usize],
+	workers: &[usize],
+	queues: &[usize],
+	num_queues: usize,
+	total_workers: usize,
+	total_tags: usize,
+	total_capacity: usize,
+) {
 	if topology_detected {
 		debug_info!(?num_cores, ?topology, ?workers, ?queues, "Frontend topology",);
 		info!(
-			device_name = ?device_name.as_deref().unwrap_or("None"),
+			device_name = ?device_name.unwrap_or("None"),
 			?num_queues,
 			?total_workers,
 			?total_tags,
@@ -242,7 +289,7 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 	} else {
 		debug_info!(?num_cores, ?topology, ?workers, ?queues, "Frontend topology (defaults)");
 		debug_warn!(
-			device_name = ?device_name.as_deref().unwrap_or("None"),
+			device_name = ?device_name.unwrap_or("None"),
 			?total_workers,
 			?total_capacity,
 			stream_width = ?stream::automatic_width(),
@@ -250,17 +297,6 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 			"Storage hardware not detected for database directory; assuming defaults.",
 		);
 	}
-
-	assert!(total_workers > 0, "some workers expected");
-	debug_assert!(
-		total_workers <= max_workers || !topology_detected,
-		"spawning too many workers"
-	);
-
-	assert!(!queues.is_empty(), "some queues expected");
-	assert!(!queues.iter().copied().all(is_equal_to!(0)), "positive queue capacity expected");
-
-	(topology, workers, queues)
 }
 
 #[expect(clippy::as_conversions, clippy::cast_precision_loss)]

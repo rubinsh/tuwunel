@@ -2,14 +2,13 @@ mod dehydrated_device;
 pub mod device;
 mod keys;
 mod ldap;
-mod profile;
 mod register;
 
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryFutureExt};
 use ruma::{
-	MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedUserId, UserId,
+	MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
 	api::client::filter::FilterDefinition,
 	events::{
 		GlobalAccountDataEventType,
@@ -20,14 +19,13 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
 	Err, Result, debug_warn, err, is_equal_to,
-	pdu::PduBuilder,
+	matrix::pdu::PduCount,
 	trace,
-	utils::{self, ReadyExt, stream::TryIgnore},
-	warn,
+	utils::{self, BoolExt, ReadyExt, stream::TryIgnore},
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
-pub use self::{keys::parse_master_key, register::Register};
+pub use self::{dehydrated_device::DehydratedDevice, keys::parse_master_key, register::Register};
 
 pub const PASSWORD_SENTINEL: &str = "*";
 pub const PASSWORD_DISABLED: &str = "";
@@ -49,23 +47,24 @@ pub struct Service {
 struct Data {
 	keychangeid_userid: Arc<Map>,
 	keyid_key: Arc<Map>,
-	onetimekeyid_onetimekeys: Arc<Map>,
+	onetimekeyid4225_otk: Option<Arc<Map>>,
 	openidtoken_expiresatuserid: Arc<Map>,
 	logintoken_expiresatuserid: Arc<Map>,
 	todeviceid_events: Arc<Map>,
+	spentrefresh_userdeviceid: Arc<Map>,
 	token_userdeviceid: Arc<Map>,
 	userdeviceid_metadata: Arc<Map>,
 	userdeviceid_token: Arc<Map>,
+	userdeviceidtoken_index: Arc<Map>,
 	userdeviceid_refresh: Arc<Map>,
+	userdeviceid_spentrefresh: Arc<Map>,
 	userdeviceidalgorithm_fallback: Arc<Map>,
 	oidcdevice_userdeviceid: Arc<Map>,
 	oidccskeybypass_userid: Arc<Map>,
 	userfilterid_filter: Arc<Map>,
-	userid_avatarurl: Arc<Map>,
-	userid_blurhash: Arc<Map>,
 	userid_dehydrateddevice: Arc<Map>,
 	userid_devicelistversion: Arc<Map>,
-	userid_displayname: Arc<Map>,
+	userid_erased: Arc<Map>,
 	userid_lastonetimekeyupdate: Arc<Map>,
 	userid_locked: Arc<Map>,
 	userid_masterkeyid: Arc<Map>,
@@ -74,7 +73,6 @@ struct Data {
 	userid_selfsigningkeyid: Arc<Map>,
 	userid_suspended: Arc<Map>,
 	userid_usersigningkeyid: Arc<Map>,
-	useridprofilekey_value: Arc<Map>,
 }
 
 impl crate::Service for Service {
@@ -84,23 +82,24 @@ impl crate::Service for Service {
 			db: Data {
 				keychangeid_userid: args.db["keychangeid_userid"].clone(),
 				keyid_key: args.db["keyid_key"].clone(),
-				onetimekeyid_onetimekeys: args.db["onetimekeyid_onetimekeys"].clone(),
+				onetimekeyid4225_otk: args.db.get("onetimekeyid4225_otk").ok().cloned(),
 				openidtoken_expiresatuserid: args.db["openidtoken_expiresatuserid"].clone(),
 				logintoken_expiresatuserid: args.db["logintoken_expiresatuserid"].clone(),
 				oidcdevice_userdeviceid: args.db["oidcdevice_userdeviceid"].clone(),
 				oidccskeybypass_userid: args.db["oidccskeybypass_userid"].clone(),
 				todeviceid_events: args.db["todeviceid_events"].clone(),
+				spentrefresh_userdeviceid: args.db["spentrefresh_userdeviceid"].clone(),
 				token_userdeviceid: args.db["token_userdeviceid"].clone(),
 				userdeviceid_metadata: args.db["userdeviceid_metadata"].clone(),
 				userdeviceid_token: args.db["userdeviceid_token"].clone(),
+				userdeviceidtoken_index: args.db["userdeviceidtoken_index"].clone(),
 				userdeviceid_refresh: args.db["userdeviceid_refresh"].clone(),
+				userdeviceid_spentrefresh: args.db["userdeviceid_spentrefresh"].clone(),
 				userdeviceidalgorithm_fallback: args.db["userdeviceidalgorithm_fallback"].clone(),
 				userfilterid_filter: args.db["userfilterid_filter"].clone(),
-				userid_avatarurl: args.db["userid_avatarurl"].clone(),
-				userid_blurhash: args.db["userid_blurhash"].clone(),
 				userid_dehydrateddevice: args.db["userid_dehydrateddevice"].clone(),
 				userid_devicelistversion: args.db["userid_devicelistversion"].clone(),
-				userid_displayname: args.db["userid_displayname"].clone(),
+				userid_erased: args.db["userid_erased"].clone(),
 				userid_lastonetimekeyupdate: args.db["userid_lastonetimekeyupdate"].clone(),
 				userid_locked: args.db["userid_locked"].clone(),
 				userid_masterkeyid: args.db["userid_masterkeyid"].clone(),
@@ -109,7 +108,6 @@ impl crate::Service for Service {
 				userid_selfsigningkeyid: args.db["userid_selfsigningkeyid"].clone(),
 				userid_suspended: args.db["userid_suspended"].clone(),
 				userid_usersigningkeyid: args.db["userid_usersigningkeyid"].clone(),
-				useridprofilekey_value: args.db["useridprofilekey_value"].clone(),
 			},
 		}))
 	}
@@ -211,6 +209,20 @@ impl Service {
 		self.services.globals.user_is_local(user_id) && self.is_active(user_id).await
 	}
 
+	/// Gate an LDAP-authenticated login into an existing local account.
+	///
+	/// Only a deactivated account is rejected. A password-origin account
+	/// passes, since a successful bind establishes the caller's identity
+	/// however their account was created, and a localpart with no local
+	/// account passes on its way to registration.
+	pub async fn check_ldap_login(&self, user_id: &UserId) -> Result {
+		self.is_deactivated(user_id)
+			.unwrap_or_else(|_| false)
+			.await
+			.is_false()
+			.ok_or_else(|| err!(Request(UserDeactivated("This user has been deactivated."))))
+	}
+
 	/// MSC3823: account is suspended (read-mostly mode, sessions retained).
 	pub async fn is_suspended(&self, user_id: &UserId) -> bool {
 		self.db
@@ -220,9 +232,43 @@ impl Service {
 			.is_ok()
 	}
 
+	/// MSC3939: reject a request from a locked account.
+	///
+	/// The rejection maps to 401 `M_USER_LOCKED` with `soft_logout: true`, so
+	/// the client retains its session and polls for the unlock. The login
+	/// route and the request middleware share this gate.
+	pub async fn locked_check(&self, user_id: &UserId) -> Result {
+		self.is_locked(user_id)
+			.await
+			.is_false()
+			.ok_or_else(|| err!(Request(UserLocked("This account has been locked."))))
+	}
+
 	/// MSC3939: account is locked (401 + soft_logout, sessions retained).
+	///
+	/// The row's presence is the entire state, and locking never invalidates
+	/// access tokens, so clearing the row restores every session intact.
+	/// Both `locked_check` and the admin lock surfaces read it.
 	pub async fn is_locked(&self, user_id: &UserId) -> bool {
 		self.db.userid_locked.get(user_id).await.is_ok()
+	}
+
+	/// MSC4025: the user's events serve as pruned copies to recipients not
+	/// joined at the event. Presence-only for the serving gate.
+	pub async fn is_erased(&self, user_id: &UserId) -> bool {
+		self.db.userid_erased.get(user_id).await.is_ok()
+	}
+
+	/// MSC4025: the global count recorded at erasure, for admin surfacing;
+	/// the serving gate never reads it.
+	pub async fn erasure_count(&self, user_id: &UserId) -> Option<PduCount> {
+		self.db
+			.userid_erased
+			.get(user_id)
+			.await
+			.deserialized()
+			.map(PduCount::from_unsigned)
+			.ok()
 	}
 
 	/// MSC3823: forensic record for the active suspension, if any.
@@ -259,6 +305,17 @@ impl Service {
 	}
 
 	pub fn clear_suspended(&self, user_id: &UserId) { self.db.userid_suspended.remove(user_id); }
+
+	/// MSC4025: mark the user erased, recording the current global count.
+	pub fn set_erased(&self, user_id: &UserId) {
+		let count = self.services.globals.current_count();
+
+		self.db.userid_erased.raw_put(user_id, count);
+	}
+
+	/// MSC4025: erasure is reversible; clearing the marker restores the
+	/// unredacted view.
+	pub fn clear_erased(&self, user_id: &UserId) { self.db.userid_erased.remove(user_id); }
 
 	pub fn set_locked(&self, user_id: &UserId, by: &UserId) {
 		let entry = Moderation {
@@ -519,17 +576,7 @@ impl Service {
 		Err!(FeatureDisabled("ldap"))
 	}
 
-	async fn update_all_rooms(&self, user_id: &UserId, rooms: Vec<(PduBuilder, &OwnedRoomId)>) {
-		for (pdu_builder, room_id) in rooms {
-			let state_lock = self.services.state.mutex.lock(room_id).await;
-			if let Err(e) = self
-				.services
-				.timeline
-				.build_and_append_pdu(pdu_builder, user_id, room_id, &state_lock)
-				.await
-			{
-				warn!(%user_id, %room_id, "Failed to update/send new profile join membership update in room: {e}");
-			}
-		}
-	}
+	#[cfg(not(feature = "ldap"))]
+	#[must_use]
+	pub fn ldap_bind_dn(&self, _localpart: &str) -> Option<String> { None }
 }

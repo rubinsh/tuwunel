@@ -1,3 +1,4 @@
+use futures::pin_mut;
 use ruma::{
 	EventId, RoomId, UserId,
 	events::{
@@ -11,11 +12,12 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Result, implement,
-	matrix::{Event, StateKey},
+	matrix::{Event, PduCount, StateKey},
 	pdu::PduBuilder,
+	utils::FutureBoolExt,
 };
 
-use crate::rooms::state::RoomMutexGuard;
+use crate::rooms::{short::ShortStateHash, state::RoomMutexGuard};
 
 /// Checks if a given user can redact a given event
 ///
@@ -117,12 +119,54 @@ pub async fn user_can_see_event(
 			self.user_was_joined(shortstatehash, user_id)
 				.await,
 
+		// An unrecognized value is treated as shared.
 		| HistoryVisibility::Shared | _ =>
-			self.services
-				.state_cache
-				.is_joined(user_id, room_id)
+			self.user_shared_history(shortstatehash, room_id, event_id, user_id)
 				.await,
 	}
+}
+
+/// Whether a user may see an event under `shared` history visibility.
+///
+/// A current member sees the whole room, which the first check answers without
+/// touching room state. A former member keeps events through their latest
+/// leave, and lookup failures deny access.
+#[implement(super::Service)]
+async fn user_shared_history(
+	&self,
+	shortstatehash: ShortStateHash,
+	room_id: &RoomId,
+	event_id: &EventId,
+	user_id: &UserId,
+) -> bool {
+	let state_cache = &self.services.state_cache;
+
+	if state_cache.is_joined(user_id, room_id).await
+		|| self
+			.user_was_joined(shortstatehash, user_id)
+			.await
+	{
+		return true;
+	}
+
+	if !state_cache.once_joined(user_id, room_id).await {
+		return false;
+	}
+
+	let Ok(left_count) = state_cache.get_left_count(room_id, user_id).await else {
+		return false;
+	};
+
+	let Ok(event_count) = self
+		.services
+		.timeline
+		.get_pdu_count(event_id)
+		.await
+	else {
+		return false;
+	};
+
+	event_count <= PduCount::from_unsigned(left_count)
 }
 
 /// Whether a user is allowed to see an event, based on
@@ -163,6 +207,25 @@ pub async fn user_can_see_state_events(&self, user_id: &UserId, room_id: &RoomId
 
 		| _ => false,
 	}
+}
+
+/// Whether a user may see a room: a current or prior membership (joined,
+/// invited, left), or a world-readable room. Forgetting a room clears the
+/// user's left-state, so a forgotten room is not visible.
+#[implement(super::Service)]
+pub async fn user_can_see_room(&self, user_id: &UserId, room_id: &RoomId) -> bool {
+	let state_cache = &self.services.state_cache;
+	let joined = state_cache.is_joined(user_id, room_id);
+	let invited = state_cache.is_invited(user_id, room_id);
+	let left = state_cache.is_left(user_id, room_id);
+	let world_readable = self.is_world_readable(room_id);
+
+	pin_mut!(joined, invited, left, world_readable);
+	joined
+		.or(invited)
+		.or(left)
+		.or(world_readable)
+		.await
 }
 
 #[implement(super::Service)]

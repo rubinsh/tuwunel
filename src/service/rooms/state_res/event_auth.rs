@@ -61,7 +61,7 @@ where
 
 	match try_join(independent, dependent).await {
 		| Err(e) if matches!(e, Error::Request(InvalidParam, ..)) => Err(e),
-		| Err(e) => Err!(Request(Forbidden("Auth check failed: {e}"))),
+		| Err(e) => Err(Error::AuthCheck(Box::new(e))),
 		| Ok(_) => Ok(()),
 	}
 }
@@ -409,6 +409,11 @@ where
 	// Since v1, if it has any previous events, reject.
 	if room_create_event.prev_events().next().is_some() {
 		return Err!("`m.room.create` event cannot have previous events");
+	}
+
+	// Since v1, if it has any auth events, reject.
+	if room_create_event.auth_events().next().is_some() {
+		return Err!("`m.room.create` event cannot have `auth_events`");
 	}
 
 	if rules.room_create_event_id_as_room_id {

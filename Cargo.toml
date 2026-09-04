@@ -29,8 +29,8 @@ keywords = [
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/matrix-construct/tuwunel"
-rust-version = "1.94.0"
-version = "1.6.2"
+rust-version = "1.95.0"
+version = "1.9.0"
 
 [workspace.metadata.crane]
 name = "tuwunel"
@@ -57,6 +57,11 @@ version = "2.3.1"
 [workspace.dependencies.async-trait]
 version = "0.1"
 
+[workspace.dependencies.aws-lc-rs]
+version = "1.17"
+default-features = false
+features = ["aws-lc-sys"]
+
 [workspace.dependencies.axum]
 version = "0.8"
 default-features = false
@@ -70,16 +75,13 @@ features = [
 	"tracing",
 ]
 
-[workspace.dependencies.axum-client-ip]
-version = "0.7"
-
 [workspace.dependencies.axum-extra]
 version = "0.12"
 default-features = false
 features = [
 	"cookie",
-	"typed-header",
 	"tracing",
+	"typed-header",
 ]
 
 [workspace.dependencies.axum-server]
@@ -94,14 +96,6 @@ default-features = false
 [workspace.dependencies.base64]
 version = "0.22"
 default-features = false
-
-[workspace.dependencies.blurhash]
-version = "0.2"
-default-features = false
-features = [
-	"fast-linear-to-srgb",
-	"image",
-]
 
 [workspace.dependencies.bytes]
 version = "1.11"
@@ -137,9 +131,8 @@ features = [
 	"usage",
 ]
 
-# Disabled until Axum updated. Remember to remove cfgs for tuwunel_disable.
-#[workspace.dependencies.console-subscriber]
-#version = "0.4"
+[workspace.dependencies.console-subscriber]
+version = "0.5"
 
 [workspace.dependencies.core_affinity]
 version = "0.8.3"
@@ -152,13 +145,16 @@ features = ["proc"]
 version = "0.8"
 default-features = false
 features = [
-	"cargo_bench_support",
 	"async_futures",
 	"async_tokio",
+	"cargo_bench_support",
 ]
 
 [workspace.dependencies.ctor]
-version = "0.10"
+version = "1.0"
+
+[workspace.dependencies.dtor]
+version = "1.0"
 
 [workspace.dependencies.cyborgtime]
 version = "2.1"
@@ -209,18 +205,18 @@ version = "0.1"
 version = "1.8"
 default-features = false
 features = [
-	"server",
 	"http1",
 	"http2",
+	"server",
 ]
 
 [workspace.dependencies.image]
 version = "0.25"
 default-features = false
 features = [
+	"gif",
 	"jpeg",
 	"png",
-	"gif",
 	"webp",
 ]
 
@@ -233,35 +229,56 @@ features = [
 [workspace.dependencies.ipaddress]
 version = "0.1"
 
+[workspace.dependencies.ipnet]
+version = "2.12"
+features = [
+	"serde",
+]
+
 [workspace.dependencies.itertools]
-version = "0.14"
+version = "0.15"
 
 [workspace.dependencies.jevmalloc]
 git = "https://github.com/matrix-construct/jevmalloc"
-rev = "93795449913f65ab533b7fa482333eef63fc3ae0"
+rev = "ef3e8e6c903aa632ab87c3dd720a448e9b98a0c4"
 
 [workspace.dependencies.jsonwebtoken]
-version = "10.3"
+version = "11.0"
 default-features = false
 features = [
 	"aws_lc_rs",
-	"ed25519-dalek",
-	"hmac",
-	"sha2",
 	"use_pem",
 ]
 
 [workspace.dependencies.ldap3]
-git = "https://github.com/matrix-construct/ldap3"
-rev = "fdfbba2bf916b53e5f73cdb1a495ebb649978079"
+version = "0.12.1"
 default-features = false
-features = ["sync", "tls-rustls"]
+features = ["sync", "tls-rustls", "tls-rustls-aws-lc-rs"]
+
+[workspace.dependencies.lettre]
+version = "0.11"
+default-features = false
+features = [
+	"aws-lc-rs",
+	"builder",
+	"hostname",
+	"pool",
+	"rustls-platform-verifier",
+	"smtp-transport",
+	"tokio1",
+	"tokio1-rustls",
+]
 
 [workspace.dependencies.libc]
 version = "0.2"
 
 [workspace.dependencies.libloading]
 version = "0.9"
+
+[workspace.dependencies.link-section]
+version = "0.19"
+default-features = false
+features = ["proc_macro"]
 
 [workspace.dependencies.log]
 version = "0.4"
@@ -281,13 +298,15 @@ version = "2.2"
 features = ["std"]
 
 [workspace.dependencies.minicbor-serde]
-version = "0.6"
+version = "0.7"
 features = ["std"]
 
 [workspace.dependencies.nix]
 version = "0"
 default-features = false
 features = [
+	"fs",
+	"net",
 	"resource",
 	"socket",
 	"user",
@@ -300,31 +319,38 @@ version = "1"
 version = "0.2"
 
 [workspace.dependencies.object_store]
-version = "0.13"
+version = "0.14"
 default-features = false
 features = [
 	"aws",
 	"fs",
-	"tls-webpki-roots",
 ]
 
 [workspace.dependencies.opentelemetry]
-version = "0.31"
+version = "0.32"
 
-# Disabled until they move to opentelemetry 0.30
-#[workspace.dependencies.opentelemetry-jaeger]
-#version = "0.22.0"
-#features = ["rt-tokio"]
+[workspace.dependencies.opentelemetry-otlp]
+version = "0.32"
+default-features = false
+features = [
+	"grpc-tonic",
+	"trace",
+]
 
 [workspace.dependencies.opentelemetry_sdk]
-version = "0.31"
-features = ["rt-tokio"]
+version = "0.32"
+
+[workspace.dependencies.pin-project-lite]
+version = "0.2"
 
 [workspace.dependencies.proc-macro2]
 version = "1.0"
 
 [workspace.dependencies.quote]
 version = "1.0"
+
+[workspace.dependencies.quoted_printable]
+version = "0.5"
 
 [workspace.dependencies.rand]
 version = "0.10"
@@ -343,13 +369,9 @@ features = [
 	"socks",
 ]
 
-[workspace.dependencies.ring]
-version = "0.17"
-default-features = false
-
 [workspace.dependencies.ruma]
 git = "https://github.com/matrix-construct/ruma"
-rev = "202cedf0e7c415dc525dad1436ef75ee24b15aa5"
+rev = "b2ea02acf10ced42667f276c72bc1c7eac23d24d"
 features = [
     "__compat",
     "appservice-api-c",
@@ -358,43 +380,56 @@ features = [
     "compat-upload-signatures",
     "federation-api",
     "identifiers-validation",
+    "identity-service-api",
     "markdown",
     "push-gateway-api-c",
     "rand",
     "ring-compat",
+    "unstable-extensible-events",
     "unstable-msc2448",
     "unstable-msc2666",
     "unstable-msc2815",
-    "unstable-msc2867",
-    "unstable-msc2870",
     "unstable-msc3026",
-    "unstable-msc3061",
-    "unstable-msc3391",
-    "unstable-msc3814",
-    "unstable-msc3824",
+    "unstable-msc3202", # encrypted appservice transaction extensions
     "unstable-msc3245",
     "unstable-msc3381", # polls
+    "unstable-msc3391",
     "unstable-msc3489", # beacon / live location
+    "unstable-msc3664", # push rules for relations
+    "unstable-msc3814",
     "unstable-msc3930", # polls push rules
+    "unstable-msc3983", # appservice one-time key claims
+    "unstable-msc3984", # appservice device key queries
     "unstable-msc4075",
-    "unstable-msc4095",
     "unstable-msc4121",
     "unstable-msc4125",
-    "unstable-msc4133",
     "unstable-msc4143",
     "unstable-msc4186",
     "unstable-msc4195",
     "unstable-msc4203", # sending to-device events to appservices
+    "unstable-msc4265",
+    "unstable-msc4266",
     "unstable-msc4310",
-    "unstable-msc4311",
     "unstable-msc4383",
-    "unstable-extensible-events",
+    "unstable-msc4388",
+    "unstable-msc4439",
+    "unstable-msc4466",
 ]
+
+[workspace.dependencies.synapse-admin-api]
+git = "https://github.com/matrix-construct/synapse-admin-api"
+rev = "5b471333acb72b1841ade61bf39e2234c24137be"
+features = ["server"]
 
 [workspace.dependencies.rustls]
 version = "0.23"
 default-features = false
-features = ["aws_lc_rs", "logging", "tls12", "prefer-post-quantum"]
+features = [
+	"aws_lc_rs",
+	"logging",
+	"prefer-post-quantum",
+	"tls12",
+]
 
 [workspace.dependencies.rustyline-async]
 version = "0.4.6"
@@ -402,9 +437,10 @@ default-features = false
 
 [workspace.dependencies.rust-rocksdb]
 git = "https://github.com/matrix-construct/rust-rocksdb"
-rev = "c11395350bc1f2090a0152f2d15c8c5847821eba"
+rev = "9c0aad8e358339afc1ab1acb658afe55a1a4c012"
 default-features = false
 features = [
+	"bindgen-runtime",
 	"bzip2",
 	"lto",
 	"lz4",
@@ -418,35 +454,38 @@ features = [
 version = "0.6"
 
 [workspace.dependencies.sd-notify]
-version = "0.4"
+version = "0.5"
 default-features = false
 
 [workspace.dependencies.sentry]
-version = "0.47"
+version = "0.48"
 default-features = false
 features = [
     "backtrace",
     "contexts",
     "debug-images",
+    "log",
     "panic",
+    "reqwest",
     "rustls",
     "tower",
     "tower-http",
     "tracing",
-    "reqwest",
-    "log",
 ]
 
 [workspace.dependencies.sentry-tower]
-version = "0.47"
+version = "0.48"
 
 [workspace.dependencies.sentry-tracing]
-version = "0.47"
+version = "0.48"
 
 [workspace.dependencies.serde]
 version = "1.0"
 default-features = false
 features = ["rc"]
+
+[workspace.dependencies.serde_bytes]
+version = "0.11"
 
 [workspace.dependencies.serde_core]
 version = "1.0"
@@ -459,6 +498,9 @@ version = "0.4"
 version = "1.0"
 default-features = false
 features = ["raw_value"]
+
+[workspace.dependencies.serde_urlencoded]
+version = "0.7"
 
 [workspace.dependencies.serde_regex]
 version = "1.1"
@@ -496,6 +538,10 @@ features = [
 	"write",
 ]
 
+[workspace.dependencies.subtle]
+version = "2.6"
+default-features = false
+
 [workspace.dependencies.syn]
 version = "2.0"
 default-features = false
@@ -503,12 +549,12 @@ features = [
 	"extra-traits",
 	"full",
 	"parsing",
-	"proc-macro",
 	"printing",
+	"proc-macro",
 ]
 
 [workspace.dependencies.termimad]
-version = "0.34"
+version = "0.35"
 default-features = false
 
 [workspace.dependencies.thiserror]
@@ -516,17 +562,18 @@ version = "2.0"
 default-features = false
 
 [workspace.dependencies.tokio]
-version = "1.52"
+version = "1.53"
 default-features = false
 features = [
 	"fs",
-	"net",
-	"macros",
-	"sync",
-	"signal",
-	"time",
-	"rt-multi-thread",
 	"io-util",
+	"macros",
+	"net",
+	"process",
+	"rt-multi-thread",
+	"signal",
+	"sync",
+	"time",
 	"tracing",
 ]
 
@@ -536,7 +583,11 @@ version = "0.5"
 [workspace.dependencies.toml]
 version = "1.0"
 default-features = false
-features = ["parse", "serde"]
+features = ["display", "parse", "serde"]
+
+[workspace.dependencies.toml_writer]
+version = "1.1"
+default-features = false
 
 [workspace.dependencies.tower]
 version = "0.5"
@@ -569,7 +620,7 @@ default-features = false
 version = "0.2"
 
 [workspace.dependencies.tracing-opentelemetry]
-version = "0.32"
+version = "0.33"
 
 [workspace.dependencies.tracing-subscriber]
 version = "0.3"
@@ -591,9 +642,6 @@ features = ["serde"]
 version = "2.0"
 default-features = false
 
-[workspace.dependencies.webpki-root-certs]
-version = "1.0"
-
 #
 # Patches
 #
@@ -604,15 +652,15 @@ version = "1.0"
 # https://github.com/girlbossceo/rustyline-async/commit/67d8c49aeac03a5ef4e818f663eaa94dd7bf339b
 [patch.crates-io.rustyline-async]
 git = "https://github.com/matrix-construct/rustyline-async"
-rev = "ba743cae940659e95d7b8604bbd6fdd755171c8c"
+rev = "879968ba99c2558ae234fd67a057b7ea6f761fd3"
 
 # adds LIFO queue scheduling; this should be updated with PR progress.
 [patch.crates-io.event-listener]
 git = "https://github.com/matrix-construct/event-listener"
-rev = "fe4aebeeaae435af60087ddd56b573a2e0be671d"
+rev = "18af85c4df39a11b44b39629783ed3ddec6a8853"
 [patch.crates-io.async-channel]
 git = "https://github.com/matrix-construct/async-channel"
-rev = "92e5e74063bf2a3b10414bcc8a0d68b235644280"
+rev = "debb93f14a20fa7c1989042c2f07f53654d75908"
 
 # adds affinity masks for selecting more than one core at a time
 [patch.crates-io.core_affinity]
@@ -622,14 +670,18 @@ rev = "ff148c2985cbaff3e6e953d45cda4d7696f38d75"
 # reverts hyperium#148 conflicting with our delicate federation resolver hooks
 [patch.crates-io.hyper-util]
 git = "https://github.com/matrix-construct/hyper-util"
-rev = "a3f59c4e51af19570a9f92839ecfe0ad6482e9e5"
+rev = "0510e3a3cba7aedd504b4ee0d69fbf41e76a524f"
 
 # allows no-aaaa option in resolv.conf
 # bumps rust edition and toolchain to 1.86.0 and 2024
 # use sat_add on line number errors
 [patch.crates-io.resolv-conf]
 git = "https://github.com/matrix-construct/resolv-conf"
-rev = "200e958941d522a70c5877e3d846f55b5586c68d"
+rev = "ab5c3e44016bc76b8798ec837a5a9cf9d88bf233"
+
+[patch.crates-io.rustls-platform-verifier]
+git = "https://github.com/matrix-construct/rustls-platform-verifier"
+rev = "c68093b6ac7d739e6b3aefb809c646a5e0210306"
 
 #
 # Our crates
@@ -701,7 +753,6 @@ lto = "fat"
 #	'-Ztls-model=local-exec',
 #	'-Zinline-mir=true',
 #	'-Zmir-opt-level=3',
-#	'-Clink-arg=-Wl,--gc-sections',
 #	'-Ztime-passes',
 #	'-Ztime-llvm-passes',
 #]
@@ -845,66 +896,67 @@ opt-level = 'z'
 #
 
 [workspace.lints.rust]
-absolute-paths-not-starting-with-crate = "warn"
-#box-pointers = "warn"
-deprecated-in-future = "warn"
-elided-lifetimes-in-paths = "warn"
-explicit-outlives-requirements = "warn"
-ffi-unwind-calls = "warn"
-keyword-idents = "warn"
-macro-extended-temporary-scopes = "warn"
-macro-use-extern-crate = "warn"
-meta-variable-misuse = "warn"
-missing-abi = "warn"
-#missing-copy-implementations = "warn"                               # TODO
-#missing-debug-implementations = "warn"                              # TODO
-non-ascii-idents = "warn"
-rust-2021-incompatible-closure-captures = "warn"
-rust-2021-incompatible-or-patterns = "warn"
-rust-2021-prefixes-incompatible-syntax = "warn"
-rust-2021-prelude-collisions = "warn"
-semicolon-in-expressions-from-macros = "warn"
-single-use-lifetimes = "warn"
-trivial-casts = "warn"
-trivial-numeric-casts = "warn"
-unit-bindings = "warn"
-#unnameable-types = "warn"                                           # TODO
-unreachable-pub = "warn"
-unsafe-op-in-unsafe-fn = "warn"
-unstable-features = "warn"
-unused-extern-crates = "warn"
-unused-import-braces = "warn"
-unused-lifetimes = "warn"
-unused-macro-rules = "warn"
-unused-must-use = "warn"
-unused-qualifications = "warn"
-#unused-results = "warn"                                             # TODO
+absolute_paths_not_starting_with_crate = "warn"
+ambiguous_negative_literals = "warn"
+closure_returning_async_block = "warn"
+deprecated_in_future = "warn"
+deref_into_dyn_supertrait = "warn"
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+ffi_unwind_calls = "warn"
+impl_trait_redundant_captures = "warn"
+keyword_idents = { level = "warn", priority = -1 }
+macro_use_extern_crate = "warn"
+meta_variable_misuse = "warn"
+missing_abi = "warn"
+missing_copy_implementations = "warn"
+#missing_debug_implementations = "warn"                              # TODO
+non_ascii_idents = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+rust_2021_incompatible_closure_captures = "warn"
+rust_2021_incompatible_or_patterns = "warn"
+rust_2021_prefixes_incompatible_syntax = "warn"
+rust_2021_prelude_collisions = "warn"
+semicolon_in_expressions_from_macros = "warn"
+single_use_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unit_bindings = "warn"
+unnameable_types = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unstable_features = "warn"
+unused_extern_crates = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+unused_must_use = "warn"
+unused_qualifications = "warn"
+#unused_results = "warn"                                             # TODO
 
 ## some sadness
-elided_named_lifetimes = "allow"                                     # TODO!
-mismatched_lifetime_syntaxes = "allow"                               # TODO!
+mismatched_lifetime_syntaxes = "allow"
+# counts every pub item of test and bench executables as dead code
+dead_code_pub_in_binary = "allow"
 let_underscore_drop = "allow"
 missing_docs = "allow"
 # cfgs cannot be limited to expected cfgs or their de facto non-transitive/opt-in use-case e.g.
 # tokio_unstable will warn.
 unexpected_cfgs = "allow"
-# this seems to suggest broken code and is not working correctly
-unused_braces = "allow"
 # buggy, but worth checking on occasionally
 unused_crate_dependencies = "allow"
 unsafe_code = "allow"
+# skips niche-encoded enums (nearly all of ours) and compares a ratio rather
+# than a magnitude; clippy::large_enum_variant covers this by size instead.
 variant_size_differences = "allow"
 
 # we check nightly clippy lints
 unknown_lints = "allow"
 
-# rust claims elided_named_lifetimes has been replaced by
-# mismatched_lifetime_syntaxes but it actually has not.
-renamed_and_removed_lints = "allow"
-
-# nightly has a new lint that conflicts with our BoolExt trait at
-# src/core/utils/bool.rs:68:48
-# <https://github.com/rust-lang/rust/issues/142748>
+# BoolExt::ok_or/ok_or_else collide with unstable bool inherents on the pinned
+# stable toolchain; silent on nightly, where std no longer has them.
+# <https://github.com/rust-lang/rust/issues/48919>
 unstable_name_collisions = "allow"                                   # TODO
 
 #######################################
@@ -934,23 +986,19 @@ nursery = { level = "warn", priority = -1 }
 
 ## some sadness
 missing_const_for_fn = { level = "allow", priority = 1 }             # TODO
-option_if_let_else = { level = "allow", priority = 1 }               # TODO
 redundant_pub_crate = { level = "allow", priority = 1 }              # TODO
-significant_drop_in_scrutinee = { level = "allow", priority = 1 }    # TODO
 significant_drop_tightening = { level = "allow", priority = 1 }      # TODO
 tuple_array_conversions = { level = "allow", priority = 1 }
+unused_async_trait_impl = { level = "allow", priority = 1 }          # trait-mandated async (FromRequestParts, #[admin_command])
 
 ###################
 pedantic = { level = "warn", priority = -1 }
 
 ## some sadness
-too_long_first_doc_paragraph = { level = "allow", priority = 1 }
 default_trait_access = { level = "allow", priority = 1 }
 doc_markdown = { level = "allow", priority = 1 }
-elidable_lifetime_names = { level = "allow", priority = 1 }
 enum_glob_use = { level = "allow", priority = 1 }
 if_not_else = { level = "allow", priority = 1 }
-if_then_some_else_none = { level = "allow", priority = 1 }
 inline_always = { level = "allow", priority = 1 }
 map_unwrap_or = { level = "allow", priority = 1 }
 match_bool = { level = "allow", priority = 1 }
@@ -958,10 +1006,7 @@ missing_docs_in_private_items = { level = "allow", priority = 1 }
 missing_errors_doc = { level = "allow", priority = 1 }
 missing_panics_doc = { level = "allow", priority = 1 }
 module_name_repetitions = { level = "allow", priority = 1 }
-needless_continue = { level = "allow", priority = 1 }
-no_effect_underscore_binding = { level = "allow", priority = 1 }
 similar_names = { level = "allow", priority = 1 }
-single_match_else = { level = "allow", priority = 1 }
 struct_excessive_bools = { level = "allow", priority = 1 }
 struct_field_names = { level = "allow", priority = 1 }
 unnecessary_wraps = { level = "allow", priority = 1 }
@@ -972,14 +1017,21 @@ perf = { level = "warn", priority = -1 }
 ###################
 #restriction = "warn"
 
+allow_attributes = "warn"
 arithmetic_side_effects = "warn"
 as_conversions = "warn"
+as_pointer_underscore = "warn"
 as_underscore = "warn"
 assertions_on_result_states = "warn"
+# moved from nursery to restriction in 1.91, silently dropping out of coverage
+cognitive_complexity = "warn"
+create_dir = "warn"
 dbg_macro = "warn"
 default_union_representation = "warn"
 deref_by_slicing = "warn"
+doc_include_without_cfg = "warn"
 empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
 empty_structs_with_brackets = "warn"
 exit = "warn"
 filetype_is_file = "warn"
@@ -987,18 +1039,37 @@ float_cmp_const = "warn"
 fn_to_numeric_cast_any = "warn"
 format_push_string = "warn"
 get_unwrap = "warn"
+# on-disk record keys are big-endian; a native or little-endian byte
+# projection near the schema is a bug
+host_endian_bytes = "warn"
+if_then_some_else_none = "warn"
 impl_trait_in_params = "warn"
+infinite_loop = "warn"
+large_include_file = "warn"
+let_underscore_must_use = "warn"
 let_underscore_untyped = "warn"
+little_endian_bytes = "warn"
 lossy_float_literal = "warn"
+map_with_unused_argument_over_ranges = "warn"
 mem_forget = "warn"
 missing_assert_message = "warn"
+mixed_read_write_in_expression = "warn"
+multiple_unsafe_ops_per_block = "warn"
 mutex_atomic = "warn"
+mutex_integer = "warn"
+needless_raw_strings = "warn"
+non_zero_suggestions = "warn"
+pathbuf_init_then_push = "warn"
+pointer_format = "warn"
+precedence_bits = "warn"
 pub_without_shorthand = "warn"
 rc_buffer = "warn"
 rc_mutex = "warn"
+redundant_test_prefix = "warn"
 redundant_type_annotations = "warn"
 semicolon_outside_block = "warn"
 str_to_string = "warn"
+string_add = "warn"
 string_lit_chars_any = "warn"
 string_slice = "warn"
 implicit_clone = "warn"
@@ -1020,9 +1091,11 @@ style = { level = "warn", priority = -1 }
 ## some sadness
 # trivial assertions are quite alright
 assertions_on_constants = { level = "allow", priority = 1 }
+# async_trait marks its generated pinned-box futures must_use; not ours to remove
+double_must_use = { level = "allow", priority = 1 }
 module_inception = { level = "allow", priority = 1 }
 obfuscated_if_else = { level = "allow", priority = 1 }
-toplevel-ref-arg = { level = "allow", priority = 1 }
+toplevel_ref_arg = { level = "allow", priority = 1 }
 
 ###################
 suspicious = { level = "warn", priority = -1 }

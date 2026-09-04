@@ -9,6 +9,7 @@ struct ProviderMetadata {
 	issuer: String,
 	authorization_endpoint: String,
 	token_endpoint: String,
+	device_authorization_endpoint: Option<String>,
 	registration_endpoint: Option<String>,
 	revocation_endpoint: Option<String>,
 	jwks_uri: String,
@@ -34,6 +35,14 @@ pub(crate) async fn openid_configuration_route(
 	let issuer = services.oauth.get_server()?.issuer_url()?;
 	let base = issuer.trim_end_matches('/').to_owned();
 
+	// MSC2964: advertise `create` only when a client can act on it, i.e. native
+	// auth is serving local registration.
+	let prompt_values: Vec<String> = (services.config.oidc_native_auth
+		&& services.config.allow_registration)
+		.then(|| "create".to_owned())
+		.into_iter()
+		.collect();
+
 	Ok(Json(ProviderMetadata {
 		issuer,
 
@@ -44,6 +53,8 @@ pub(crate) async fn openid_configuration_route(
 		userinfo_endpoint: Some(format!("{base}/_tuwunel/oidc/userinfo")),
 
 		token_endpoint: format!("{base}/_tuwunel/oidc/token"),
+
+		device_authorization_endpoint: Some(format!("{base}/_tuwunel/oidc/device_authorization")),
 
 		jwks_uri: format!("{base}/_tuwunel/oidc/jwks"),
 
@@ -59,7 +70,7 @@ pub(crate) async fn openid_configuration_route(
 
 		id_token_signing_alg_values_supported: Some(vec!["ES256".to_owned()]),
 
-		prompt_values_supported: Some(vec![]),
+		prompt_values_supported: Some(prompt_values),
 
 		subject_types_supported: Some(vec!["public".to_owned()]),
 
@@ -68,6 +79,7 @@ pub(crate) async fn openid_configuration_route(
 		grant_types_supported: Some(vec![
 			"authorization_code".to_owned(),
 			"refresh_token".to_owned(),
+			"urn:ietf:params:oauth:grant-type:device_code".to_owned(),
 		]),
 
 		token_endpoint_auth_methods_supported: Some(vec![
@@ -78,7 +90,9 @@ pub(crate) async fn openid_configuration_route(
 
 		scopes_supported: Some(vec![
 			"openid".to_owned(),
+			"urn:matrix:client:api:*".to_owned(),
 			"urn:matrix:org.matrix.msc2967.client:api:*".to_owned(),
+			"urn:matrix:client:device:*".to_owned(),
 			"urn:matrix:org.matrix.msc2967.client:device:*".to_owned(),
 		]),
 

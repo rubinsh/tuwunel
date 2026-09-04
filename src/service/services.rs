@@ -9,14 +9,15 @@ use tuwunel_database::Database;
 
 pub(crate) use crate::OnceServices;
 use crate::{
-	account_data, admin, appservice, client, config, deactivate, emergency, federation, globals,
-	key_backups,
+	account_data, admin, appservice, client, config, deactivate, emergency, federation, fetcher,
+	globals, key_backups,
 	manager::Manager,
-	media, membership, oauth, presence, pusher, registration_tokens, resolver,
+	media, membership, oauth, presence, profile, pusher, registration_tokens, rendezvous,
+	resolver,
 	rooms::{self, retention},
-	sending, server_keys,
+	sending, sendmail, server_keys,
 	service::{Args, Service},
-	storage, sync, transaction_ids, uiaa, users,
+	storage, sync, tasks, threepid, transaction_ids, uiaa, users,
 };
 
 pub struct Services {
@@ -26,6 +27,7 @@ pub struct Services {
 	pub config: Arc<config::Service>,
 	pub client: Arc<client::Service>,
 	pub emergency: Arc<emergency::Service>,
+	pub fetcher: Arc<fetcher::Service>,
 	pub globals: Arc<globals::Service>,
 	pub key_backups: Arc<key_backups::Service>,
 	pub media: Arc<media::Service>,
@@ -57,6 +59,7 @@ pub struct Services {
 	pub sending: Arc<sending::Service>,
 	pub server_keys: Arc<server_keys::Service>,
 	pub sync: Arc<sync::Service>,
+	pub tasks: Arc<tasks::Service>,
 	pub transaction_ids: Arc<transaction_ids::Service>,
 	pub uiaa: Arc<uiaa::Service>,
 	pub users: Arc<users::Service>,
@@ -65,6 +68,10 @@ pub struct Services {
 	pub oauth: Arc<oauth::Service>,
 	pub retention: Arc<retention::Service>,
 	pub registration_tokens: Arc<registration_tokens::Service>,
+	pub rendezvous: Arc<rendezvous::Service>,
+	pub sendmail: Arc<sendmail::Service>,
+	pub threepid: Arc<threepid::Service>,
+	pub profile: Arc<profile::Service>,
 
 	manager: Mutex<Option<Arc<Manager>>>,
 	pub server: Arc<Server>,
@@ -89,6 +96,7 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		client: client::Service::build(&args)?,
 		config: config::Service::build(&args)?,
 		emergency: emergency::Service::build(&args)?,
+		fetcher: fetcher::Service::build(&args)?,
 		globals: globals::Service::build(&args)?,
 		key_backups: key_backups::Service::build(&args)?,
 		media: media::Service::build(&args)?,
@@ -119,6 +127,7 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		sending: sending::Service::build(&args)?,
 		server_keys: server_keys::Service::build(&args)?,
 		sync: sync::Service::build(&args)?,
+		tasks: tasks::Service::build(&args)?,
 		transaction_ids: transaction_ids::Service::build(&args)?,
 		uiaa: uiaa::Service::build(&args)?,
 		users: users::Service::build(&args)?,
@@ -127,6 +136,10 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		oauth: oauth::Service::build(&args)?,
 		retention: retention::Service::build(&args)?,
 		registration_tokens: registration_tokens::Service::build(&args)?,
+		rendezvous: rendezvous::Service::build(&args)?,
+		sendmail: sendmail::Service::build(&args)?,
+		threepid: threepid::Service::build(&args)?,
+		profile: profile::Service::build(&args)?,
 
 		manager: Mutex::new(None),
 		server,
@@ -152,6 +165,7 @@ pub(crate) fn services(&self) -> impl Iterator<Item = Arc<dyn Service>> + Send {
 		cast!(self.client),
 		cast!(self.config),
 		cast!(self.emergency),
+		cast!(self.fetcher),
 		cast!(self.globals),
 		cast!(self.key_backups),
 		cast!(self.media),
@@ -181,6 +195,7 @@ pub(crate) fn services(&self) -> impl Iterator<Item = Arc<dyn Service>> + Send {
 		cast!(self.sending),
 		cast!(self.server_keys),
 		cast!(self.sync),
+		cast!(self.tasks),
 		cast!(self.transaction_ids),
 		cast!(self.uiaa),
 		cast!(self.users),
@@ -189,6 +204,8 @@ pub(crate) fn services(&self) -> impl Iterator<Item = Arc<dyn Service>> + Send {
 		cast!(self.oauth),
 		cast!(self.retention),
 		cast!(self.registration_tokens),
+		cast!(self.rendezvous),
+		cast!(self.profile),
 	]
 	.into_iter()
 }
@@ -255,6 +272,10 @@ pub async fn poll(&self) -> Result {
 
 #[implement(Services)]
 pub async fn clear_cache(&self) {
+	// Uncorked, every per-key delete in a database-backed cache flushes the
+	// write-ahead log; the rows are reconstructible, so no fsync is owed.
+	let _cork = self.db.cork_and_flush();
+
 	self.services()
 		.stream()
 		.for_each(async |service| {

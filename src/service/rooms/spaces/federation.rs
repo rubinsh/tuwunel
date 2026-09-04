@@ -7,7 +7,7 @@ use ruma::{
 	},
 	room::RoomType,
 };
-use tuwunel_core::{Err, Result, debug, implement, trace};
+use tuwunel_core::{Err, Result, debug, implement};
 
 use super::{
 	Accessibility,
@@ -53,20 +53,25 @@ pub(super) async fn get_summary_and_children_federation(
 		"waiting for federation response"
 	);
 
-	let Some(Ok(Response { room, children, inaccessible_children })) = requests.next().await
-	else {
+	let mut response = None;
+	while let Some(result) = requests.next().await {
+		match result {
+			| Ok(ok_response) => {
+				debug!(?ok_response, "federation response");
+
+				response = Some(ok_response);
+				break;
+			},
+			| Err(error) => {
+				debug!(?error, "federation error");
+			},
+		}
+	}
+
+	let Some(Response { room, children, inaccessible_children }) = response else {
 		self.cache_put(current_room, None);
 		return Err!(Request(NotFound("Space room not found over federation.")));
 	};
-
-	trace!(
-		?current_room,
-		?sender,
-		?room,
-		?children,
-		?inaccessible_children,
-		"federation response"
-	);
 
 	for room_id in &inaccessible_children {
 		self.cache_put(room_id, None);

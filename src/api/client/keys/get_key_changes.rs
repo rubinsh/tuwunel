@@ -6,7 +6,7 @@ use tuwunel_core::{Result, at, err, utils::stream::BroadbandExt};
 
 use crate::Ruma;
 
-/// # `POST /_matrix/client/r0/keys/changes`
+/// # `GET /_matrix/client/r0/keys/changes`
 ///
 /// Gets a list of users who have updated their device identity keys since the
 /// previous sync token.

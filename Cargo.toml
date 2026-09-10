@@ -421,6 +421,19 @@ git = "https://github.com/matrix-construct/synapse-admin-api"
 rev = "5b471333acb72b1841ade61bf39e2234c24137be"
 features = ["server"]
 
+# Test-only. The push-gateway acceptance test stands up a real TLS listener on
+# loopback and generates its own CA, so the pinned route is proven against a
+# server that actually validates rather than against a resolver's return value.
+[workspace.dependencies.rcgen]
+version = "0.14"
+default-features = false
+features = ["crypto", "pem", "aws_lc_rs"]
+
+[workspace.dependencies.tokio-rustls]
+version = "0.26"
+default-features = false
+features = ["aws-lc-rs", "logging", "tls12"]
+
 [workspace.dependencies.rustls]
 version = "0.23"
 default-features = false

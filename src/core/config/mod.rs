@@ -19,7 +19,7 @@ pub mod well_known;
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	net::IpAddr,
+	net::{IpAddr, SocketAddr},
 	path::{Path, PathBuf},
 };
 
@@ -847,6 +847,51 @@ pub struct Config {
 	/// default: 15
 	#[serde(default = "default_pusher_idle_timeout")]
 	pub pusher_idle_timeout: u64,
+
+	/// Exact push gateway notification URL that may be reached at a pinned
+	/// address, bypassing `ip_range_denylist` for that one request and nothing
+	/// else.
+	///
+	/// A push gateway co-located with the homeserver sits on loopback or on an
+	/// overlay range, both of which `ip_range_denylist` denies by default. This
+	/// reaches it without widening that denylist for any other destination:
+	/// the exemption is keyed on the **final notification URL**, so a different
+	/// path, a different port or a different host on the same gateway all stay
+	/// on the ordinary client and the ordinary denylist.
+	///
+	/// Must be set together with `pusher_protected_gateway_addr`. The URL has to
+	/// be absolute HTTPS with a domain host — an IP literal is refused, because
+	/// the certificate check against that hostname is what stops another local
+	/// process from binding the port and receiving notifications.
+	///
+	/// example: "https://gateway.example.com:3101/_matrix/push/v1/notify"
+	pub pusher_protected_gateway_url: Option<Url>,
+
+	/// Socket address the protected gateway URL is pinned to.
+	///
+	/// Resolution for that one URL is *replaced*, not permitted: DNS is not
+	/// consulted, so rebinding and a poisoned cache do not apply. The response
+	/// peer must then equal this address exactly or the notification is
+	/// rejected after the fact.
+	///
+	/// The port must equal the effective port of `pusher_protected_gateway_url`.
+	/// reqwest always connects to the port in the URL and ignores the port in a
+	/// resolution override, so a differing port here would silently do nothing;
+	/// startup refuses it rather than letting the configuration lie.
+	///
+	/// example: "127.0.0.1:3101"
+	pub pusher_protected_gateway_addr: Option<SocketAddr>,
+
+	/// Additional PEM trust anchor accepted only by the protected gateway
+	/// client.
+	///
+	/// A co-located gateway is commonly issued by a private CA. This adds that
+	/// CA for the protected request alone; every other client keeps the
+	/// platform trust store untouched. Certificate validation itself is never
+	/// relaxed — this widens who may issue, not whether the name is checked.
+	///
+	/// example: "/etc/tuwunel/gateway-ca.pem"
+	pub pusher_protected_gateway_ca: Option<PathBuf>,
 
 	/// Maximum time to receive a request from a client (seconds).
 	///
@@ -3839,6 +3884,21 @@ pub struct WellKnownConfig {
 	/// reloadable: yes
 	/// example: "matrix.example.com:443"
 	pub server: Option<OwnedServerName>,
+
+	/// Push gateway advertised to clients through
+	/// `/.well-known/matrix/client`.
+	///
+	/// Published under the vendor key `com.chat-harness.push_gateway.url`. It
+	/// is namespaced to this project rather than `m.` or `org.matrix.` because
+	/// no MSC has been allocated for it; claiming an unallocated Matrix.org
+	/// name is the one thing here that would obstruct upstreaming later.
+	///
+	/// Absent by default, and when absent the response is byte-identical to
+	/// one from a server without this option. Standard fields are untouched
+	/// either way.
+	///
+	/// example: "https://gateway.example.com:3101/_matrix/push/v1/notify"
+	pub push_gateway: Option<Url>,
 
 	/// Defines contacts published by the support discovery endpoint.
 	///

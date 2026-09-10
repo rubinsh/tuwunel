@@ -31,6 +31,10 @@ pub struct Clients {
 	pub sender: Client,
 	pub appservice: Client,
 	pub pusher: Client,
+
+	/// The one client permitted to reach the configured gateway at its pinned
+	/// address. `None` unless an operator configured a protected route.
+	pub pusher_protected: Option<Client>,
 	pub oauth: Client,
 }
 
@@ -43,6 +47,21 @@ pub struct Service {
 	/// aligned even if configuration or environment values later change.
 	pub proxy: Arc<ProxySnapshot>,
 	pub cidr_range_denylist: Arc<[IPAddress]>,
+
+	/// The one push gateway URL that may be reached at a pinned address.
+	///
+	/// Snapshotted beside the clients for the same reason the proxy policy is:
+	/// the client was built against these values, and a later configuration
+	/// change must not make the request-time match disagree with the override
+	/// compiled into the client.
+	pub protected_gateway: Option<ProtectedGateway>,
+}
+
+/// An exact notification URL and the address it is pinned to.
+#[derive(Clone, Debug)]
+pub struct ProtectedGateway {
+	pub url: Url,
+	pub addr: SocketAddr,
 }
 
 impl Deref for Service {
@@ -74,6 +93,12 @@ impl crate::Service for Service {
 				.collect::<Result<Vec<_>, String>>()
 				.map(Arc::from)
 				.map_err(|e| err!(Config("ip_range_denylist", e)))?,
+
+			protected_gateway: config
+				.pusher_protected_gateway_url
+				.as_ref()
+				.zip(config.pusher_protected_gateway_addr)
+				.map(|(url, addr)| ProtectedGateway { url: url.clone(), addr }),
 		}))
 	}
 
@@ -184,11 +209,115 @@ fn make_clients(services: &Services) -> Result<Clients> {
 			))
 			.redirect(guarded_redirect(services, 2))),
 
+		pusher_protected: protected_pusher(services)?,
+
 		oauth: with!(cb => cb
 			.dns_resolver(Arc::clone(&services.resolver.resolver))
 			.redirect(Policy::limited(0))
 			.pool_max_idle_per_host(1)),
 	})
+}
+
+/// The client for the one configured push gateway URL, pinned to one address.
+///
+/// This is a *narrowing* of the ordinary pusher client, not a relaxation of it.
+/// Everything the ordinary client does defensively is still done here, and
+/// three things it leaves to configuration are forced:
+///
+/// - **no proxy.** `base` applies the configured proxy; a proxied request would
+///   not reach the pinned address at all, and its peer would be the proxy.
+/// - **certificate validation on.** `base` honours
+///   `allow_invalid_tls_certificates`. Startup already refuses the combination,
+///   so this is the second lock: a future change to that check cannot silently
+///   turn the pin into an open port.
+/// - **no redirects.** A hop away from the configured URL would leave this
+///   client pointed somewhere nobody configured, still carrying the exemption.
+///
+/// The resolution override *replaces* DNS for the gateway's hostname rather
+/// than permitting it, so what DNS answers — including a poisoned or rebound
+/// answer — cannot move the connection. The validating resolver stays installed
+/// underneath: the pinned name never reaches it, and anything else this client
+/// were ever asked for stays denylist-filtered.
+fn protected_pusher(services: &Services) -> Result<Option<Client>> {
+	let config = &services.config;
+
+	let (Some(url), Some(addr)) = (
+		config.pusher_protected_gateway_url.as_ref(),
+		config.pusher_protected_gateway_addr,
+	) else {
+		return Ok(None);
+	};
+
+	let host = url
+		.host_str()
+		.expect("startup validated the protected gateway URL has a domain host");
+
+	let mut builder = base(config, &services.client.proxy, Some("pusher-protected"))?
+		.no_proxy()
+		.danger_accept_invalid_certs(false)
+		.redirect(Policy::none())
+		.resolve(host, addr)
+		.dns_resolver(Validating::new(
+			Arc::clone(&services.resolver.resolver),
+			Arc::clone(&services.client.cidr_range_denylist),
+			services.client.proxy.shared_hosts(),
+		))
+		.pool_max_idle_per_host(1)
+		.pool_idle_timeout(Duration::from_secs(config.pusher_idle_timeout));
+
+	// A co-located gateway is usually issued by a private CA. Adding it here
+	// widens who may issue a certificate for the gateway's name; it does not
+	// widen which names are accepted, and no other client sees this anchor.
+	if let Some(path) = config.pusher_protected_gateway_ca.as_ref() {
+		let pem = std::fs::read(path).map_err(|e| {
+			err!(Config(
+				"pusher_protected_gateway_ca",
+				"Cannot read the protected gateway trust anchor at {path:?}: {e}"
+			))
+		})?;
+
+		for cert in reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+			err!(Config(
+				"pusher_protected_gateway_ca",
+				"The protected gateway trust anchor at {path:?} is not a PEM bundle: {e}"
+			))
+		})? {
+			builder = builder.add_root_certificate(cert);
+		}
+	}
+
+	builder
+		.build()
+		.map(Some)
+		.map_err(|e| err!(error!(chain = %error_chain(&e), "Failed to construct the protected push gateway client")))
+}
+
+/// The pinned address for a request URL, when the protected route covers it.
+#[implement(Service)]
+#[inline]
+#[must_use]
+pub fn protected_pusher_route(&self, url: &Url) -> Option<SocketAddr> {
+	protected_route(self.protected_gateway.as_ref(), url)
+}
+
+/// Whether a request URL is *the* configured gateway URL.
+///
+/// Comparison is on the whole normalized URL, not on the host. A resolution
+/// override is hostname-wide and cannot see a port or a path, so matching by
+/// host would hand the exemption to every URL on that name — a different path
+/// on the same gateway included. Matching the final URL is what makes "exactly
+/// one destination" true rather than merely intended.
+///
+/// `Url`'s equality is over the serialized form, which is already normalized:
+/// the scheme and host are lowercased at parse, and a default port is dropped.
+/// Percent-encoding and a trailing slash are *not* normalized away, so two
+/// spellings of the same path do not match — which is the safe direction, since
+/// a miss falls back to the ordinary denylisted client.
+#[must_use]
+fn protected_route(gateway: Option<&ProtectedGateway>, url: &Url) -> Option<SocketAddr> {
+	let configured = gateway?;
+
+	(configured.url == *url).then_some(configured.addr)
 }
 
 /// Construction for the URL preview client: bound to the configured

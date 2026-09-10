@@ -84,6 +84,7 @@ pub fn check(config: &Config) -> Result {
 	check_media_providers(config)?;
 	check_well_known_support_contact_validity(config)?;
 	check_email(config)?;
+	check_push_gateway(config)?;
 
 	Ok(())
 }
@@ -823,4 +824,147 @@ fn warn_unknown_key(config: &Config) -> Result {
 	} else {
 		Ok(())
 	}
+}
+
+/// Validates the advertised push gateway and the protected route to it.
+///
+/// Both capabilities are off unless configured, and both are validated here
+/// rather than where they are used: a gateway URL that is wrong in a way the
+/// running server tolerates becomes a gateway that silently stops receiving
+/// notifications, which looks identical to no notifications being generated.
+fn check_push_gateway(config: &Config) -> Result {
+	if let Some(url) = config.well_known.push_gateway.as_ref() {
+		if let Some(problem) = gateway_url_problem(url) {
+			return Err!(Config("well_known.push_gateway", "{problem}"));
+		}
+
+		let path = config.notification_push_path.as_str();
+		if url.path() != path {
+			return Err!(Config(
+				"well_known.push_gateway",
+				"The advertised gateway path is {:?}, but this server's \
+				 notification_push_path is {path:?}. Publishing a path clients cannot notify \
+				 would be worse than publishing nothing.",
+				url.path(),
+			));
+		}
+	}
+
+	let (url, addr) = match (
+		config.pusher_protected_gateway_url.as_ref(),
+		config.pusher_protected_gateway_addr,
+	) {
+		| (None, None) => {
+			// The trust anchor alone does nothing, and an operator who set it
+			// is expecting a protected route they have not configured.
+			if config.pusher_protected_gateway_ca.is_some() {
+				return Err!(Config(
+					"pusher_protected_gateway_ca",
+					"A trust anchor is configured without a protected gateway route. Set \
+					 pusher_protected_gateway_url and pusher_protected_gateway_addr, or \
+					 remove this."
+				));
+			}
+
+			return Ok(());
+		},
+		| (Some(_), None) =>
+			return Err!(Config(
+				"pusher_protected_gateway_addr",
+				"A protected gateway URL is configured without an address to pin it to."
+			)),
+		| (None, Some(_)) =>
+			return Err!(Config(
+				"pusher_protected_gateway_url",
+				"A protected gateway address is configured without a URL to pin."
+			)),
+		| (Some(url), Some(addr)) => (url, addr),
+	};
+
+	if let Some(problem) = gateway_url_problem(url) {
+		return Err!(Config("pusher_protected_gateway_url", "{problem}"));
+	}
+
+	// reqwest always connects to the port in the URL and ignores the port
+	// carried by a resolution override, so an address whose port differs from
+	// the URL's would be quietly ignored and the pin would not mean what it
+	// says. The post-connect peer check would then reject every notification.
+	let url_port = url
+		.port_or_known_default()
+		.expect("an https URL always has a known default port");
+
+	if addr.port() != url_port {
+		return Err!(Config(
+			"pusher_protected_gateway_addr",
+			"The pinned port {} does not match the gateway URL port {url_port}. reqwest \
+			 connects to the URL's port and ignores this one, so the mismatch would not do \
+			 what it appears to.",
+			addr.port(),
+		));
+	}
+
+	// The protected client forces validation on regardless, but an operator
+	// running with the global escape hatch on is not in a position to rely on a
+	// certificate check, and silently contradicting their setting for one
+	// client is its own surprise. Refuse the combination instead.
+	if config.allow_invalid_tls_certificates {
+		return Err!(Config(
+			"pusher_protected_gateway_url",
+			"A protected gateway route cannot be used while allow_invalid_tls_certificates \
+			 is enabled. The pinned address is a port no process owns; the certificate check \
+			 for the gateway's hostname is what stops another local process from binding it \
+			 and receiving notifications."
+		));
+	}
+
+	if let Some(ca) = config.pusher_protected_gateway_ca.as_ref() {
+		read_to_string(ca).map_err(|e| {
+			err!(Config(
+				"pusher_protected_gateway_ca",
+				"Cannot read the protected gateway trust anchor at {ca:?}: {e}"
+			))
+		})?;
+	}
+
+	Ok(())
+}
+
+/// Shared shape checks for a push gateway notification URL.
+///
+/// Returns the reason rather than a built error, because `Err!(Config(..))`
+/// wants the configuration key as a literal and this runs for two of them.
+///
+/// An IP-literal host is refused deliberately. TLS can authenticate one through
+/// an IP SAN, but the protected route's guarantee rests on validating a name
+/// the gateway operator controls, and an address literal moves that trust onto
+/// whoever holds the address.
+fn gateway_url_problem(url: &Url) -> Option<String> {
+	if url.scheme() != "https" {
+		return Some(format!("A push gateway URL must be https, not {:?}.", url.scheme()));
+	}
+
+	match url.host() {
+		| Some(url::Host::Domain(_)) => {},
+		| Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) =>
+			return Some(
+				"A push gateway URL must name a domain, not an IP literal. The certificate \
+				 check against that name is what the route's protection rests on."
+					.to_owned(),
+			),
+		| None => return Some("A push gateway URL must have a host.".to_owned()),
+	}
+
+	if !url.username().is_empty() || url.password().is_some() {
+		return Some("A push gateway URL must not carry credentials.".to_owned());
+	}
+
+	if url.query().is_some() {
+		return Some("A push gateway URL must not carry a query string.".to_owned());
+	}
+
+	if url.fragment().is_some() {
+		return Some("A push gateway URL must not carry a fragment.".to_owned());
+	}
+
+	None
 }

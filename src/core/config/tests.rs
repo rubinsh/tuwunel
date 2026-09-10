@@ -905,3 +905,189 @@ fn int_literal(token: &str) -> Option<u64> {
 		.contains(&suffix)
 		.and_then(|| digits.parse().ok())
 }
+
+/// Startup validation for the advertised gateway and the protected route.
+///
+/// Every rejection here is a configuration that would otherwise "work" — the
+/// server boots, and notifications quietly stop arriving or quietly take a
+/// route the operator did not intend. That failure mode is indistinguishable
+/// from no notifications being generated, which is why these are startup errors
+/// rather than warnings.
+mod push_gateway {
+	use super::{Config, check, config_from_toml};
+
+	const NOTIFY: &str = "/_matrix/push/v1/notify";
+
+	fn config(body: &str) -> Config {
+		config_from_toml(&format!("[global]\n{body}")).expect("test config parses")
+	}
+
+	fn rejection(body: &str) -> String {
+		check(&config(body))
+			.expect_err("this configuration should be refused at startup")
+			.to_string()
+	}
+
+	#[test]
+	fn both_capabilities_are_off_by_default() {
+		let config = config("");
+
+		assert!(config.well_known.push_gateway.is_none());
+		assert!(config.pusher_protected_gateway_url.is_none());
+		assert!(config.pusher_protected_gateway_addr.is_none());
+		check(&config).expect("a server configuring neither capability still starts");
+	}
+
+	#[test]
+	fn a_complete_route_is_accepted() {
+		let config = config(&format!(
+			r#"
+pusher_protected_gateway_url = "https://gateway.example.com:3101{NOTIFY}"
+pusher_protected_gateway_addr = "127.0.0.1:3101"
+[global.well_known]
+push_gateway = "https://gateway.example.com:3101{NOTIFY}"
+"#
+		));
+
+		check(&config).expect("a complete gateway configuration starts");
+	}
+
+	#[test]
+	fn a_url_without_an_address_is_refused() {
+		// Half a route is not a safe half-measure: the URL alone builds no
+		// protected client, so the gateway stays unreachable while the
+		// configuration says otherwise.
+		let err = rejection(&format!(
+			"pusher_protected_gateway_url = \"https://gateway.example.com:3101{NOTIFY}\"\n"
+		));
+
+		assert!(err.contains("without an address"), "{err}");
+	}
+
+	#[test]
+	fn an_address_without_a_url_is_refused() {
+		let err = rejection("pusher_protected_gateway_addr = \"127.0.0.1:3101\"\n");
+
+		assert!(err.contains("without a URL"), "{err}");
+	}
+
+	#[test]
+	fn a_trust_anchor_without_a_route_is_refused() {
+		// It would do nothing at all, and an operator who set it believes they
+		// configured a route.
+		let err = rejection("pusher_protected_gateway_ca = \"/dev/null\"\n");
+
+		assert!(err.contains("without a protected gateway route"), "{err}");
+	}
+
+	#[test]
+	fn a_mismatched_pin_port_is_refused() {
+		// reqwest connects to the URL's port and ignores the override's, so
+		// this configuration would silently not do what it reads as — and then
+		// the post-connect peer check would reject every notification.
+		let err = rejection(&format!(
+			r#"
+pusher_protected_gateway_url = "https://gateway.example.com:3101{NOTIFY}"
+pusher_protected_gateway_addr = "127.0.0.1:9999"
+"#
+		));
+
+		assert!(err.contains("does not match the gateway URL port"), "{err}");
+	}
+
+	#[test]
+	fn a_plaintext_gateway_url_is_refused() {
+		let err = rejection(&format!(
+			r#"
+pusher_protected_gateway_url = "http://gateway.example.com:3101{NOTIFY}"
+pusher_protected_gateway_addr = "127.0.0.1:3101"
+"#
+		));
+
+		assert!(err.contains("must be https"), "{err}");
+	}
+
+	#[test]
+	fn an_ip_literal_gateway_url_is_refused() {
+		// The pin's protection is the certificate check against a name the
+		// gateway operator controls. An address literal moves that trust onto
+		// whoever holds the address.
+		let err = rejection(&format!(
+			r#"
+pusher_protected_gateway_url = "https://127.0.0.1:3101{NOTIFY}"
+pusher_protected_gateway_addr = "127.0.0.1:3101"
+"#
+		));
+
+		assert!(err.contains("must name a domain"), "{err}");
+	}
+
+	#[test]
+	fn credentials_a_query_or_a_fragment_are_refused() {
+		for (suffix, expected) in [
+			("?token=x", "query string"),
+			("#frag", "fragment"),
+		] {
+			let err = rejection(&format!(
+				r#"
+pusher_protected_gateway_url = "https://gateway.example.com:3101{NOTIFY}{suffix}"
+pusher_protected_gateway_addr = "127.0.0.1:3101"
+"#
+			));
+
+			assert!(err.contains(expected), "{suffix}: {err}");
+		}
+
+		let err = rejection(&format!(
+			r#"
+pusher_protected_gateway_url = "https://user:pw@gateway.example.com:3101{NOTIFY}"
+pusher_protected_gateway_addr = "127.0.0.1:3101"
+"#
+		));
+
+		assert!(err.contains("credentials"), "{err}");
+	}
+
+	#[test]
+	fn a_route_alongside_the_global_tls_escape_hatch_is_refused() {
+		// The protected client forces validation on regardless. This refuses
+		// the combination anyway: an operator running with the escape hatch on
+		// cannot rely on a certificate check, and the pinned port is one no
+		// process owns.
+		let err = rejection(&format!(
+			r#"
+allow_invalid_tls_certificates = true
+pusher_protected_gateway_url = "https://gateway.example.com:3101{NOTIFY}"
+pusher_protected_gateway_addr = "127.0.0.1:3101"
+"#
+		));
+
+		assert!(err.contains("allow_invalid_tls_certificates"), "{err}");
+	}
+
+	#[test]
+	fn an_advertised_path_this_server_does_not_serve_is_refused() {
+		// Publishing a path clients cannot notify is worse than publishing
+		// nothing: discovery succeeds and every notification is lost.
+		let err = rejection(
+			r#"
+[global.well_known]
+push_gateway = "https://gateway.example.com:3101/_matrix/push/v1/elsewhere"
+"#,
+		);
+
+		assert!(err.contains("notification_push_path"), "{err}");
+	}
+
+	#[test]
+	fn the_advertised_url_obeys_the_same_shape_rules() {
+		let err = rejection(&format!(
+			r#"
+[global.well_known]
+push_gateway = "http://gateway.example.com:3101{NOTIFY}"
+"#
+		));
+
+		assert!(err.contains("must be https"), "{err}");
+	}
+}

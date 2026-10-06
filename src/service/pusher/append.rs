@@ -1,9 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use futures::{
-	FutureExt, StreamExt,
-	future::{join, join4},
-};
+use futures::{FutureExt, StreamExt, future::join};
 use ruma::{
 	EventId, RoomId, UserId,
 	api::client::push::ProfileTag,
@@ -23,9 +20,7 @@ use tuwunel_core::{
 		pdu::{Count, Pdu, PduId, RawPduId},
 	},
 	trace,
-	utils::{
-		BoolExt, ReadyExt, future::TryExtExt, option::OptionExt, result::ErrLog, time::now_millis,
-	},
+	utils::{BoolExt, ReadyExt, future::TryExtExt, result::ErrLog, time::now_millis},
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
@@ -162,11 +157,7 @@ async fn append_pdu_for_user(
 		})
 		.await;
 
-	let notify = actions.iter().any(Action::should_notify);
-
-	let highlight = actions.iter().any(|action| {
-		matches!(action, Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)))
-	});
+	let (notify, highlight) = notify_and_highlight(actions);
 
 	trace!(
 		%user,
@@ -177,38 +168,16 @@ async fn append_pdu_for_user(
 		"Push rules evaluated",
 	);
 
-	// Mutually-exclusive partition: each notify (and each highlight)
-	// lands in either the room-level or thread bucket, never both.
-	let main_notify = (notify && thread_root.is_none())
-		.then_async(|| self.increment_notificationcount(pdu.room_id(), user));
-
-	let main_highlight = (highlight && thread_root.is_none())
-		.then_async(|| self.increment_highlightcount(pdu.room_id(), user));
-
-	let thread_notify = thread_root
-		.filter(|_| notify)
-		.map_async(|root| self.increment_thread_notificationcount(pdu.room_id(), user, root));
-
-	let thread_highlight = thread_root
-		.filter(|_| highlight)
-		.map_async(|root| self.increment_thread_highlightcount(pdu.room_id(), user, root));
-
-	join4(main_notify, thread_notify, main_highlight, thread_highlight).await;
-
 	if notify || highlight {
-		let id: PduId = (*pdu_id).into();
-		let notified = Notified {
-			ts: now_millis(),
-			sroomid: id.shortroomid,
-			tag: None,
-			actions: actions.into(),
-		};
-
-		if matches!(id.count, Count::Normal(_)) {
-			self.db
-				.useridcount_notification
-				.put((user, id.count.into_unsigned()), Json(notified));
-		}
+		self.count_notified(
+			user,
+			pdu_id,
+			pdu.room_id(),
+			thread_root,
+			actions,
+			(notify, highlight),
+		)
+		.await;
 	}
 
 	if notify || highlight || self.services.config.push_everything {
@@ -225,50 +194,68 @@ async fn append_pdu_for_user(
 	}
 }
 
-#[implement(super::Service)]
-async fn increment_notificationcount(&self, room_id: &RoomId, user_id: &UserId) {
-	let db = &self.db.userroomid_notificationcount;
-	let key = (room_id.to_owned(), user_id.to_owned());
-	let _lock = self.notification_increment_mutex.lock(&key).await;
+/// Whether push actions notify, and whether they highlight.
+pub(super) fn notify_and_highlight(actions: &[Action]) -> (bool, bool) {
+	let notify = actions.iter().any(Action::should_notify);
 
-	increment(db, (user_id, room_id)).await;
+	let highlight = actions.iter().any(|action| {
+		matches!(action, Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)))
+	});
+
+	(notify, highlight)
 }
 
+/// Records a notified event and counts it, in its thread's bucket or the
+/// room's.
+///
+/// Both happen under the room's count locks, so a read that recounts from the
+/// records (`notification.rs`) sees every counted event or none of it.
 #[implement(super::Service)]
-async fn increment_highlightcount(&self, room_id: &RoomId, user_id: &UserId) {
-	let db = &self.db.userroomid_highlightcount;
-	let key = (room_id.to_owned(), user_id.to_owned());
-	let _lock = self.highlight_increment_mutex.lock(&key).await;
-
-	increment(db, (user_id, room_id)).await;
-}
-
-#[implement(super::Service)]
-async fn increment_thread_notificationcount(
+async fn count_notified(
 	&self,
+	user: &UserId,
+	pdu_id: &RawPduId,
 	room_id: &RoomId,
-	user_id: &UserId,
-	thread_root: &EventId,
+	thread_root: Option<&EventId>,
+	actions: &[Action],
+	(notify, highlight): (bool, bool),
 ) {
-	let db = &self.db.userroomid_notificationcount;
-	let key = (room_id.to_owned(), user_id.to_owned());
-	let _lock = self.notification_increment_mutex.lock(&key).await;
+	let key = (room_id.to_owned(), user.to_owned());
+	let _notification = self.notification_increment_mutex.lock(&key).await;
+	let _highlight = self.highlight_increment_mutex.lock(&key).await;
 
-	increment_thread(db, (user_id, room_id, thread_root)).await;
-}
+	let id: PduId = (*pdu_id).into();
+	if matches!(id.count, Count::Normal(_)) {
+		let notified = Notified {
+			ts: now_millis(),
+			sroomid: id.shortroomid,
+			tag: None,
+			actions: actions.into(),
+		};
 
-#[implement(super::Service)]
-async fn increment_thread_highlightcount(
-	&self,
-	room_id: &RoomId,
-	user_id: &UserId,
-	thread_root: &EventId,
-) {
-	let db = &self.db.userroomid_highlightcount;
-	let key = (room_id.to_owned(), user_id.to_owned());
-	let _lock = self.highlight_increment_mutex.lock(&key).await;
+		self.db
+			.useridcount_notification
+			.put((user, id.count.into_unsigned()), Json(notified));
+	}
 
-	increment_thread(db, (user_id, room_id, thread_root)).await;
+	// Mutually-exclusive partition: each notify (and each highlight)
+	// lands in either the room-level or thread bucket, never both.
+	let notifications = &self.db.userroomid_notificationcount;
+	let highlights = &self.db.userroomid_highlightcount;
+	match thread_root {
+		| None => {
+			let main_notify = notify.then_async(|| increment(notifications, (user, room_id)));
+			let main_highlight = highlight.then_async(|| increment(highlights, (user, room_id)));
+			join(main_notify, main_highlight).await;
+		},
+		| Some(root) => {
+			let thread_notify =
+				notify.then_async(|| increment_thread(notifications, (user, room_id, root)));
+			let thread_highlight =
+				highlight.then_async(|| increment_thread(highlights, (user, room_id, root)));
+			join(thread_notify, thread_highlight).await;
+		},
+	}
 }
 
 async fn increment(db: &Arc<Map>, key: (&UserId, &RoomId)) {

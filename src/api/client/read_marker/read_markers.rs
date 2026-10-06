@@ -13,7 +13,7 @@ use ruma::{
 use tuwunel_core::Result;
 use tuwunel_service::presence::Ping;
 
-use super::{reset_and_refresh_badge, set_private_marker};
+use super::{read_and_refresh_badge, set_private_marker};
 use crate::{ClientIp, Ruma};
 
 /// # `POST /_matrix/client/r0/rooms/{roomId}/read_markers`
@@ -99,14 +99,27 @@ pub(crate) async fn set_read_marker_route(
 		},
 	};
 
-	// Route through the dispatcher so per-thread counts are also cleared;
-	// `/read_markers` predates MSC3771 and carries no thread field.
-	if private_advanced || public_advanced {
-		reset_and_refresh_badge(
+	// Unthreaded, so per-thread counts are read too; `/read_markers` predates
+	// MSC3771 and carries no thread field.
+	let advanced: Vec<_> = [
+		body.private_read_receipt
+			.as_deref()
+			.filter(|_| private_advanced),
+		body.read_receipt
+			.as_deref()
+			.filter(|_| public_advanced),
+	]
+	.into_iter()
+	.flatten()
+	.collect();
+
+	if !advanced.is_empty() {
+		read_and_refresh_badge(
 			&services,
 			sender_user,
 			&body.room_id,
 			&ReceiptThread::Unthreaded,
+			&advanced,
 		)
 		.await;
 	}

@@ -9,7 +9,7 @@ use ruma::{EventId, OwnedEventId, RoomId, UserId, events::receipt::ReceiptThread
 use serde::Serialize;
 use tuwunel_core::{
 	Result, implement,
-	matrix::pdu::PduId,
+	matrix::pdu::{Count, PduId, RawPduId},
 	trace,
 	utils::{
 		stream::{BroadbandExt, ReadyExt, TryIgnore},
@@ -217,7 +217,7 @@ pub async fn read_notification_counts(
 
 	match thread {
 		| ReceiptThread::Main =>
-			self.lower_main_counts(user_id, room_id, read_up_to, unread.main)
+			self.lower_main_counts(user_id, room_id, unread.main)
 				.await,
 		| ReceiptThread::Thread(root) => {
 			let after = unread
@@ -229,7 +229,7 @@ pub async fn read_notification_counts(
 				.await;
 		},
 		| _ => {
-			self.lower_main_counts(user_id, room_id, read_up_to, unread.main)
+			self.lower_main_counts(user_id, room_id, unread.main)
 				.await;
 
 			for root in self
@@ -247,20 +247,15 @@ pub async fn read_notification_counts(
 			}
 		},
 	}
+
+	self.clear_read_pushes(user_id, room_id, thread, read_up_to)
+		.await;
 }
 
 /// Lowers the main-timeline counts to `after`, the notified events past the
-/// receipt at `read_up_to`, and stamps the read for sync. Deferred pushes up
-/// to the receipt are dropped; the ones after it are still unread and stay
-/// queued. The caller holds the count locks.
+/// receipt, and stamps the read for sync. The caller holds the count locks.
 #[implement(super::Service)]
-async fn lower_main_counts(
-	&self,
-	user_id: &UserId,
-	room_id: &RoomId,
-	read_up_to: u64,
-	after: (u64, u64),
-) {
+async fn lower_main_counts(&self, user_id: &UserId, room_id: &RoomId, after: (u64, u64)) {
 	let userroom_id = (user_id, room_id);
 	let (notifications, highlights) = join(
 		self.db
@@ -287,11 +282,6 @@ async fn lower_main_counts(
 	self.db
 		.roomuserid_lastnotificationread
 		.put((room_id, user_id), *count);
-
-	let removed = self.clear_suppressed_room_through(user_id, room_id, read_up_to);
-	if removed > 0 {
-		trace!(?user_id, ?room_id, removed, "Cleared suppressed push events after read");
-	}
 }
 
 /// Lowers one thread's counts to `after`, the notified events past the
@@ -340,6 +330,56 @@ async fn lower_thread_counts(
 		.put((room_id, user_id, root), *count);
 }
 
+/// Drops the deferred pushes a receipt reads: those at or before its event,
+/// in its scope. An unthreaded receipt covers the whole room, a main receipt
+/// the main timeline, and a thread receipt that thread; pushes past the
+/// receipt or in another scope are still unread and stay queued.
+#[implement(super::Service)]
+async fn clear_read_pushes(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	thread: &ReceiptThread,
+	read_up_to: u64,
+) {
+	let mut read = Vec::new();
+	for pdu_id in self.suppressed_room_pdus(user_id, room_id) {
+		let id: PduId = pdu_id.into();
+		if matches!(id.count, Count::Normal(count) if count > read_up_to) {
+			continue;
+		}
+
+		let in_scope = match thread {
+			| ReceiptThread::Main => self.thread_of(&pdu_id).await.is_none(),
+			| ReceiptThread::Thread(root) => self.thread_of(&pdu_id).await.as_ref() == Some(root),
+			| _ => true,
+		};
+
+		if in_scope {
+			read.push(pdu_id);
+		}
+	}
+
+	let removed = self.clear_suppressed_room_pdus(user_id, room_id, &read);
+	if removed > 0 {
+		trace!(?user_id, ?room_id, removed, "Cleared suppressed push events after read");
+	}
+}
+
+/// The thread an event belongs to; `None` for the main timeline, or when its
+/// PDU is gone.
+#[implement(super::Service)]
+async fn thread_of(&self, pdu_id: &RawPduId) -> Option<OwnedEventId> {
+	let pdu = self
+		.services
+		.timeline
+		.get_pdu_from_id(pdu_id)
+		.await
+		.ok()?;
+
+	self.services.threads.get_thread_id(&pdu).await
+}
+
 /// Counts the user's notified events in the room after PDU count
 /// `read_up_to`, by thread scope.
 ///
@@ -362,15 +402,7 @@ async fn unread_after(&self, user_id: &UserId, room_id: &RoomId, read_up_to: u64
 	let mut unread = Unread::default();
 	for (count, notified) in notified {
 		let pdu_id = PduId { shortroomid, count: count.into() };
-		let thread = match self
-			.services
-			.timeline
-			.get_pdu_from_id(&pdu_id.into())
-			.await
-		{
-			| Ok(pdu) => self.services.threads.get_thread_id(&pdu).await,
-			| Err(_) => None,
-		};
+		let thread = self.thread_of(&pdu_id.into()).await;
 
 		let (notify, highlight) = notify_and_highlight(&notified.actions);
 		let counts = match thread {
@@ -395,6 +427,20 @@ pub async fn notification_count(&self, user_id: &UserId, room_id: &RoomId) -> u6
 		.await
 		.deserialized()
 		.unwrap_or(0)
+}
+
+/// The room's unread notification count, main timeline and threads together.
+#[implement(super::Service)]
+pub async fn room_notification_count(&self, user_id: &UserId, room_id: &RoomId) -> u64 {
+	let (main, threads) = join(
+		self.notification_count(user_id, room_id),
+		self.thread_notification_counts(user_id, room_id),
+	)
+	.await;
+
+	threads
+		.values()
+		.fold(main, |total, &(notifications, _)| total.saturating_add(notifications))
 }
 
 /// Return the user's account-wide unread notification count.

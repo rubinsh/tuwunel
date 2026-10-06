@@ -6,23 +6,41 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tokio::time::{sleep, timeout};
+use tokio::{
+	io::{AsyncReadExt, AsyncWriteExt},
+	net::TcpListener as GatewayListener,
+	spawn,
+	sync::mpsc::{UnboundedReceiver, unbounded_channel},
+	time::{sleep, timeout},
+};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Err, Result, err,
-	ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId},
+	matrix::pdu::RawPduId,
+	ruma::{
+		EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
+		api::client::push::{
+			Pusher, PusherIds, PusherInit, PusherKind,
+			set_pusher::v3::Request as SetPusherRequest,
+		},
+		device_id,
+		push::HttpPusherData,
+	},
 };
 use tuwunel_service::{Services, users::Register};
 
 const READER_TOKEN: &str = "receipt-partial-counts-reader-token";
 const WRITER_TOKEN: &str = "receipt-partial-counts-writer-token";
+const PUSHKEY: &str = "receipt-partial-counts-pushkey";
+const GATEWAY_PUSHKEY: &str = "receipt-partial-counts-gateway";
 
 /// A receipt reads up to its event, not the whole room.
 ///
 /// Notified events after the receipt stay counted, per thread scope: a reader
 /// who stops partway through a room keeps the rest unread, mentions included.
 /// A scope's count never rises on a receipt, so an earlier receipt cannot
-/// bring back what a later one already read.
+/// bring back what a later one already read. Deferred pushes follow the
+/// same scope and position.
 #[test]
 fn receipt_keeps_later_events_unread() -> Result {
 	let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -38,6 +56,7 @@ fn receipt_keeps_later_events_unread() -> Result {
 		"address=[\"127.0.0.1\"]".to_owned(),
 		format!("port={port}"),
 		"listening=true".to_owned(),
+		"ip_range_denylist=[]".to_owned(),
 	]);
 
 	let runtime = Runtime::new(Some(&args))?;
@@ -84,6 +103,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	partial_read(&reader, &writer, &counts).await?;
 	read_markers_partial_read(&reader, &writer, &counts).await?;
 	thread_scopes(&reader, &writer, &counts).await?;
+	deferred_pushes(&reader, &writer, &counts).await?;
+	thread_push_delivered(&reader, &writer, &counts).await?;
 
 	Ok(())
 }
@@ -204,6 +225,105 @@ async fn thread_scopes(reader: &Client<'_>, writer: &Client<'_>, counts: &Counts
 		.await
 }
 
+/// A receipt drops the deferred pushes it reads and keeps the rest: those
+/// after it, and those in another thread scope.
+async fn deferred_pushes(
+	reader: &Client<'_>,
+	writer: &Client<'_>,
+	counts: &Counts<'_>,
+) -> Result {
+	let room = writer.create_room().await?;
+	reader.join(&room).await?;
+
+	let root = writer.text(&room, "d1", "root", None).await?;
+	let reply = writer
+		.reply_in_thread(&room, "d2", &root, Some(counts.user_id))
+		.await?;
+
+	let main = writer.text(&room, "d3", "main", None).await?;
+	let last = writer.text(&room, "d4", "last", None).await?;
+	counts.wait_main(&room, (3, 0)).await?;
+	counts.wait_thread(&room, &root, (1, 1)).await?;
+
+	let queued = counts
+		.defer(&room, &[&root, &reply, &main, &last])
+		.await?;
+	let [root, reply, main, last] = queued.as_slice() else {
+		return Err!("four pushes were deferred");
+	};
+
+	// Main up to `main`: the thread's reply is another scope, `last` is after.
+	reader
+		.receipt(&room, &main.0, Some("main"))
+		.await?;
+	counts.expect_deferred(&room, &[reply.1, last.1], "a main receipt")?;
+
+	// The thread's own receipt reads its reply; the main push after stays.
+	reader
+		.receipt(&room, &reply.0, Some(root.0.as_str()))
+		.await?;
+
+	counts.expect_deferred(&room, &[last.1], "a thread receipt")?;
+
+	// Unthreaded on the first message: nothing left is at or before it.
+	reader.receipt(&room, &root.0, None).await?;
+	counts.expect_deferred(&room, &[last.1], "an unthreaded receipt behind the rest")
+}
+
+/// A thread's deferred push is delivered after the main timeline is read: the
+/// flush asks whether the room has anything unread, threads included.
+async fn thread_push_delivered(
+	reader: &Client<'_>,
+	writer: &Client<'_>,
+	counts: &Counts<'_>,
+) -> Result {
+	let room = writer.create_room().await?;
+	reader.join(&room).await?;
+
+	let root = writer.text(&room, "e1", "root", None).await?;
+	let reply = writer
+		.reply_in_thread(&room, "e2", &root, Some(counts.user_id))
+		.await?;
+
+	let main = writer.text(&room, "e3", "main", None).await?;
+	counts.wait_main(&room, (2, 0)).await?;
+	counts.wait_thread(&room, &root, (1, 1)).await?;
+
+	let mut delivered = counts.gateway().await?;
+	let queued = counts
+		.defer_to(GATEWAY_PUSHKEY, &room, &[&root, &reply, &main])
+		.await?;
+
+	reader.receipt(&room, &main, Some("main")).await?;
+	counts
+		.expect_main(&room, (0, 0), "a main receipt on the latest main message")
+		.await?;
+
+	counts.expect_deferred(&room, &[queued[1].1], "a main receipt with a thread unread")?;
+
+	counts
+		.services
+		.sending
+		.flush_suppressed_for_user(counts.user_id.to_owned(), "receipt-partial-counts")
+		.await;
+
+	timeout(Duration::from_secs(5), async {
+		while let Some(body) = delivered.recv().await {
+			if body.contains(reply.as_str()) {
+				return true;
+			}
+		}
+
+		false
+	})
+	.await
+	.ok()
+	.filter(|found| *found)
+	.ok_or_else(|| err!("the thread's deferred push was not delivered"))?;
+
+	Ok(())
+}
+
 /// One user's view of the room's counts, as the server stores them.
 struct Counts<'a> {
 	services: &'a Services,
@@ -229,6 +349,107 @@ impl Counts<'_> {
 			.pusher
 			.thread_notification_counts(self.user_id, room_id)
 			.await
+	}
+
+	/// A push gateway for the user, answering every notification; each
+	/// request body arrives on the returned channel.
+	async fn gateway(&self) -> Result<UnboundedReceiver<String>> {
+		let listener = GatewayListener::bind(("127.0.0.1", 0)).await?;
+		let url = format!("http://{}/_matrix/push/v1/notify", listener.local_addr()?);
+		let (tx, rx) = unbounded_channel();
+
+		spawn(async move {
+			while let Ok((mut socket, _)) = listener.accept().await {
+				let mut request = Vec::new();
+				let mut buf = [0_u8; 4096];
+				while let Ok(Ok(read @ 1..)) =
+					timeout(Duration::from_millis(200), socket.read(&mut buf)).await
+				{
+					request.extend_from_slice(&buf[..read]);
+				}
+
+				let response = "HTTP/1.1 200 OK\r\nContent-Type: \
+				                application/json\r\nContent-Length: 15\r\nConnection: \
+				                close\r\n\r\n{\"rejected\":[]}";
+
+				socket.write_all(response.as_bytes()).await.ok();
+				tx.send(String::from_utf8_lossy(&request).into_owned())
+					.ok();
+			}
+		});
+
+		let pusher: Pusher = PusherInit {
+			ids: PusherIds::new(GATEWAY_PUSHKEY.to_owned(), "receipt.counts.test".to_owned()),
+			kind: PusherKind::Http(HttpPusherData::new(url)),
+			app_display_name: "Receipt counts".into(),
+			device_display_name: "Receipt counts".into(),
+			profile_tag: None,
+			lang: "en".into(),
+		}
+		.into();
+
+		self.services
+			.pusher
+			.set_pusher(
+				self.user_id,
+				device_id!("RECEIPTCOUNTS"),
+				&SetPusherRequest::post(pusher).action,
+			)
+			.await?;
+
+		Ok(rx)
+	}
+
+	/// Defers a push for each event, as the pusher does while the user is
+	/// active, and returns each event with its PDU id.
+	async fn defer(
+		&self,
+		room_id: &RoomId,
+		events: &[&EventId],
+	) -> Result<Vec<(OwnedEventId, RawPduId)>> {
+		self.defer_to(PUSHKEY, room_id, events).await
+	}
+
+	async fn defer_to(
+		&self,
+		pushkey: &str,
+		room_id: &RoomId,
+		events: &[&EventId],
+	) -> Result<Vec<(OwnedEventId, RawPduId)>> {
+		let mut queued = Vec::new();
+		for event_id in events {
+			let pdu_id = self
+				.services
+				.timeline
+				.get_pdu_id(event_id)
+				.await?;
+			if !self
+				.services
+				.pusher
+				.queue_suppressed_push(self.user_id, pushkey, room_id, pdu_id)
+			{
+				return Err!("the push for {event_id} was not deferred");
+			}
+
+			queued.push(((*event_id).to_owned(), pdu_id));
+		}
+
+		Ok(queued)
+	}
+
+	/// The room's deferred pushes are `want`, in order; read without taking
+	/// them.
+	fn expect_deferred(&self, room_id: &RoomId, want: &[RawPduId], after: &str) -> Result {
+		let got = self
+			.services
+			.pusher
+			.suppressed_room_pdus(self.user_id, room_id);
+
+		if got != want {
+			return Err!("after {after}, the deferred pushes are {got:?}, not {want:?}");
+		}
+
+		Ok(())
 	}
 
 	/// Push evaluation trails the send response, so a count is polled until

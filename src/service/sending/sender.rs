@@ -1744,10 +1744,12 @@ impl Service {
 		debug!(?user_id, pushkey, rooms = rooms.len(), "Flushing suppressed pushes ({reason})");
 
 		for (room_id, pdu_ids) in rooms {
+			// Threads included: a receipt keeps a thread's deferred pushes while
+			// its main timeline is read.
 			let unread = self
 				.services
 				.pusher
-				.notification_count(user_id, &room_id)
+				.room_notification_count(user_id, &room_id)
 				.await;
 
 			if unread == 0 {

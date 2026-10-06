@@ -217,7 +217,7 @@ pub async fn read_notification_counts(
 
 	match thread {
 		| ReceiptThread::Main =>
-			self.lower_main_counts(user_id, room_id, unread.main)
+			self.lower_main_counts(user_id, room_id, read_up_to, unread.main)
 				.await,
 		| ReceiptThread::Thread(root) => {
 			let after = unread
@@ -229,7 +229,7 @@ pub async fn read_notification_counts(
 				.await;
 		},
 		| _ => {
-			self.lower_main_counts(user_id, room_id, unread.main)
+			self.lower_main_counts(user_id, room_id, read_up_to, unread.main)
 				.await;
 
 			for root in self
@@ -250,9 +250,17 @@ pub async fn read_notification_counts(
 }
 
 /// Lowers the main-timeline counts to `after`, the notified events past the
-/// receipt, and stamps the read for sync. The caller holds the count locks.
+/// receipt at `read_up_to`, and stamps the read for sync. Deferred pushes up
+/// to the receipt are dropped; the ones after it are still unread and stay
+/// queued. The caller holds the count locks.
 #[implement(super::Service)]
-async fn lower_main_counts(&self, user_id: &UserId, room_id: &RoomId, after: (u64, u64)) {
+async fn lower_main_counts(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	read_up_to: u64,
+	after: (u64, u64),
+) {
 	let userroom_id = (user_id, room_id);
 	let (notifications, highlights) = join(
 		self.db
@@ -280,7 +288,7 @@ async fn lower_main_counts(&self, user_id: &UserId, room_id: &RoomId, after: (u6
 		.roomuserid_lastnotificationread
 		.put((room_id, user_id), *count);
 
-	let removed = self.clear_suppressed_room(user_id, room_id);
+	let removed = self.clear_suppressed_room_through(user_id, room_id, read_up_to);
 	if removed > 0 {
 		trace!(?user_id, ?room_id, removed, "Cleared suppressed push events after read");
 	}

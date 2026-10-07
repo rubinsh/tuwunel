@@ -1179,6 +1179,7 @@ async fn load_joined_room(
 	let (joined_room, device_list_updates, left_encrypted_users) = finalize_joined_room(
 		services,
 		sender_user,
+		room_id,
 		filter,
 		state_events,
 		aggregates,
@@ -1476,6 +1477,7 @@ struct FinalizeJoinFlags {
 async fn finalize_joined_room(
 	services: &Services,
 	sender_user: &UserId,
+	room_id: &RoomId,
 	filter: &FilterDefinition,
 	state_events: Vec<PduEvent>,
 	aggregates: JoinAggregates,
@@ -1523,6 +1525,8 @@ async fn finalize_joined_room(
 	)
 	.await;
 
+	let want_thread_unread = filter.room.timeline.unread_thread_notifications;
+	let fetched_thread_counts = thread_counts.clone();
 	let (unread_notifications, unread_thread_notifications) = assemble_unread_notifications(
 		notification_count,
 		highlight_count,
@@ -1534,7 +1538,7 @@ async fn finalize_joined_room(
 		in_window,
 	);
 
-	let joined_room = build_joined_room(
+	let mut joined_room = build_joined_room(
 		BuildJoinedRoom {
 			receipt_events,
 			typing_events,
@@ -1556,7 +1560,44 @@ async fn finalize_joined_room(
 		filter.event_fields.as_deref(),
 	);
 
+	// Clients take a thread missing from `unread_thread_notifications` as read
+	// (js-sdk resets it to zero), so a room that goes out at all carries every
+	// unread thread, not only those whose cursor moved. A room with nothing
+	// else to say stays out, as before, so a quiet sync still long-polls.
+	if want_thread_unread && !joined_room.is_empty() {
+		let thread_counts = match fetched_thread_counts {
+			| Some(thread_counts) => thread_counts,
+			| None =>
+				services
+					.pusher
+					.thread_notification_counts(sender_user, room_id)
+					.await,
+		};
+
+		add_unread_threads(&mut joined_room.unread_thread_notifications, thread_counts);
+	}
+
 	(joined_room, device_list_updates, left_encrypted_users)
+}
+
+/// Add every thread with unread notifications that `threads` doesn't already
+/// carry. Entries already there, including a thread just read to zero, stay.
+fn add_unread_threads(
+	threads: &mut BTreeMap<OwnedEventId, UnreadNotificationsCount>,
+	thread_counts: BTreeMap<OwnedEventId, (u64, u64)>,
+) {
+	for (root, (notifications, highlights)) in thread_counts {
+		if notifications == 0 && highlights == 0 {
+			continue;
+		}
+
+		threads
+			.entry(root)
+			.or_insert_with(|| UnreadNotificationsCount {
+				notification_count: UInt::try_from(notifications).ok(),
+				highlight_count: UInt::try_from(highlights).ok(),
+			});
+	}
 }
 
 fn build_joined_room(args: BuildJoinedRoom, event_fields: Option<&[String]>) -> JoinedRoom {
@@ -2406,5 +2447,38 @@ mod tests {
 		assert!(matches!(StateAfter::from((true, false)), StateAfter::Stable));
 		assert!(matches!(StateAfter::from((false, true)), StateAfter::Unstable));
 		assert!(matches!(StateAfter::from((true, true)), StateAfter::Unstable));
+	}
+
+	#[test]
+	fn add_unread_threads_keeps_listed_threads_and_adds_unread_ones() {
+		let root = |id: &str| -> OwnedEventId { id.try_into().unwrap() };
+		let counts = |n: u32, h: u32| UnreadNotificationsCount {
+			notification_count: Some(n.into()),
+			highlight_count: Some(h.into()),
+		};
+
+		// Thread a was just read to zero and is listed; b is unread and not
+		// listed; c is read and not listed.
+		let mut threads = BTreeMap::from([(root("$a"), counts(0, 0))]);
+		let stored =
+			BTreeMap::from([(root("$a"), (0, 0)), (root("$b"), (2, 1)), (root("$c"), (0, 0))]);
+
+		add_unread_threads(&mut threads, stored);
+
+		let got: BTreeMap<_, _> = threads
+			.iter()
+			.map(|(root, counts)| {
+				(root.as_str(), (counts.notification_count, counts.highlight_count))
+			})
+			.collect();
+
+		assert_eq!(
+			got,
+			BTreeMap::from([
+				("$a", (Some(0_u32.into()), Some(0_u32.into()))),
+				("$b", (Some(2_u32.into()), Some(1_u32.into()))),
+			]),
+			"a listed thread stays, an unread one is added, a read one is not"
+		);
 	}
 }

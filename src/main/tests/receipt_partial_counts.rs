@@ -103,6 +103,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	partial_read(&reader, &writer, &counts).await?;
 	read_markers_partial_read(&reader, &writer, &counts).await?;
 	thread_scopes(&reader, &writer, &counts).await?;
+	own_send_scope(&reader, &writer, &counts).await?;
 	deferred_pushes(&reader, &writer, &counts).await?;
 	thread_push_delivered(&reader, &writer, &counts).await?;
 
@@ -222,6 +223,66 @@ async fn thread_scopes(reader: &Client<'_>, writer: &Client<'_>, counts: &Counts
 
 	counts
 		.expect_thread(&room, &thread_root, (0, 0), "an unthreaded receipt on the newest message")
+		.await
+}
+
+/// A user's own send reads only its scope: writing in the main timeline keeps
+/// their unread threads, and replying in one thread keeps the others and the
+/// main timeline.
+async fn own_send_scope(reader: &Client<'_>, writer: &Client<'_>, counts: &Counts<'_>) -> Result {
+	let room = writer.create_room().await?;
+	reader.join(&room).await?;
+
+	let first_root = writer
+		.text(&room, "s1", "first root", None)
+		.await?;
+	let second_root = writer
+		.text(&room, "s2", "second root", None)
+		.await?;
+	writer
+		.reply_in_thread(&room, "s3", &first_root, None)
+		.await?;
+	writer
+		.reply_in_thread(&room, "s4", &second_root, Some(counts.user_id))
+		.await?;
+
+	counts.wait_main(&room, (2, 0)).await?;
+	counts
+		.wait_thread(&room, &first_root, (1, 0))
+		.await?;
+	counts
+		.wait_thread(&room, &second_root, (1, 1))
+		.await?;
+
+	reader
+		.text(&room, "s5", "in the main timeline", None)
+		.await?;
+	counts
+		.expect_main(&room, (0, 0), "the reader's own main send")
+		.await?;
+	counts
+		.expect_thread(&room, &first_root, (1, 0), "the reader's own main send")
+		.await?;
+	counts
+		.expect_thread(&room, &second_root, (1, 1), "the reader's own main send")
+		.await?;
+
+	writer
+		.text(&room, "s6", "main again", None)
+		.await?;
+	counts.wait_main(&room, (1, 0)).await?;
+
+	reader
+		.reply_in_thread(&room, "s7", &first_root, None)
+		.await?;
+	counts
+		.expect_thread(&room, &first_root, (0, 0), "the reader's own reply in that thread")
+		.await?;
+	counts
+		.expect_thread(&room, &second_root, (1, 1), "the reader's reply in another thread")
+		.await?;
+	counts
+		.expect_main(&room, (1, 0), "the reader's reply in a thread")
 		.await
 }
 

@@ -13,7 +13,7 @@ use ruma::{
 use tuwunel_core::{Err, Result};
 use tuwunel_service::presence::Ping;
 
-use super::{reset_and_refresh_badge, set_private_marker};
+use super::{read_and_refresh_badge, set_private_marker};
 use crate::{ClientIp, Ruma};
 
 /// # `POST /_matrix/client/r0/rooms/{roomId}/receipt/{receiptType}/{eventId}`
@@ -140,7 +140,10 @@ pub(crate) async fn create_receipt_route(
 	};
 
 	if advanced {
-		reset_and_refresh_badge(&services, sender_user, &body.room_id, &body.thread).await;
+		read_and_refresh_badge(&services, sender_user, &body.room_id, &body.thread, &[
+			&body.event_id
+		])
+		.await;
 	}
 
 	Ok(create_receipt::v3::Response {})

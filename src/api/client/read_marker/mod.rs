@@ -46,20 +46,27 @@ async fn set_private_marker(
 	Ok(advanced)
 }
 
-/// Clears the receipt's notification counts and refreshes the push badge.
+/// Marks the receipt's notifications read up to the latest of `events` and
+/// refreshes the push badge.
 ///
-/// The refresh follows every advance because the gateway can hold a stale
-/// badge while the stored count is already zero; only a delivery reconciles
-/// it.
-async fn reset_and_refresh_badge(
+/// The notified events after it stay unread. The refresh follows every
+/// advance because the gateway can hold a stale badge while the stored count
+/// is already lower; only a delivery reconciles it.
+async fn read_and_refresh_badge(
 	services: &Services,
 	user_id: &UserId,
 	room_id: &RoomId,
 	thread: &ReceiptThread,
+	events: &[&EventId],
 ) {
+	let mut read_up_to = None;
+	for event in events {
+		read_up_to = read_up_to.max(read_position(services, event).await);
+	}
+
 	services
 		.pusher
-		.reset_notification_counts_for_thread(user_id, room_id, thread)
+		.read_notification_counts(user_id, room_id, thread, read_up_to)
 		.await;
 
 	services
@@ -68,4 +75,16 @@ async fn reset_and_refresh_badge(
 		.await
 		.log_err()
 		.ok();
+}
+
+/// The PDU count a receipt on `event` reads up to.
+///
+/// A backfilled event sits before every counted one, so nothing counted is
+/// read. An event this server cannot place gives no position.
+async fn read_position(services: &Services, event: &EventId) -> Option<u64> {
+	match services.timeline.get_pdu_count(event).await {
+		| Ok(PduCount::Normal(count)) => Some(count),
+		| Ok(PduCount::Backfilled(_)) => Some(0),
+		| Err(_) => None,
+	}
 }

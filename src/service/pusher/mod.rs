@@ -384,6 +384,22 @@ pub fn get_notifications<'a>(
 		.map(|((_, count), notified)| (count, notified))
 }
 
+/// The user's notified events after PDU count `after`, oldest first.
+#[implement(Service)]
+pub(super) fn get_notifications_after<'a>(
+	&'a self,
+	sender: &'a UserId,
+	after: u64,
+) -> impl Stream<Item = (u64, Notified)> + Send + 'a {
+	self.db
+		.useridcount_notification
+		.stream_from(&(sender, after.saturating_add(1)))
+		.ignore_err()
+		.map(|item: ((&UserId, u64), _)| (item.0, item.1))
+		.ready_take_while(move |((user_id, _count), _)| sender == *user_id)
+		.map(|((_, count), notified)| (count, notified))
+}
+
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn get_actions<'a>(

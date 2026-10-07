@@ -4,7 +4,7 @@
 //! intentionally in-memory only: suppressed events are discarded on restart.
 
 use std::{
-	collections::{HashMap, VecDeque},
+	collections::{HashMap, HashSet, VecDeque},
 	sync::Mutex,
 };
 
@@ -51,6 +51,43 @@ impl SuppressedQueue {
 			.into_iter()
 			.map(|event| event.pdu_id)
 			.collect()
+	}
+
+	/// Removes the room's queued PDUs that `read` selects, across all of the
+	/// user's pushkeys, and returns how many went.
+	fn clear_room(
+		&self,
+		user_id: &UserId,
+		room_id: &RoomId,
+		read: impl Fn(&RawPduId) -> bool,
+	) -> usize {
+		let mut inner = self.lock();
+		let Some(user_entry) = inner.get_mut(user_id) else {
+			return 0;
+		};
+
+		let mut removed: usize = 0;
+		user_entry.retain(|_, push_entry| {
+			if let Some(queue) = push_entry.rooms.get_mut(room_id) {
+				let before = queue.len();
+				queue.retain(|event| !read(&event.pdu_id));
+				let cleared = before.saturating_sub(queue.len());
+
+				removed = removed.saturating_add(cleared);
+				push_entry.total_events = push_entry.total_events.saturating_sub(cleared);
+				if queue.is_empty() {
+					push_entry.rooms.remove(room_id);
+				}
+			}
+
+			!push_entry.rooms.is_empty()
+		});
+
+		if user_entry.is_empty() {
+			inner.remove(user_id);
+		}
+
+		removed
 	}
 
 	fn drop_one_front(queue: &mut VecDeque<SuppressedEvent>, total_events: &mut usize) -> bool {
@@ -181,28 +218,37 @@ pub fn take_suppressed_for_user(&self, user_id: &UserId) -> SuppressedPushes {
 /// Clear suppressed PDUs for a specific room (across all pushkeys).
 #[implement(super::Service)]
 pub fn clear_suppressed_room(&self, user_id: &UserId, room_id: &RoomId) -> usize {
-	let mut inner = self.suppressed.lock();
-	let Some(user_entry) = inner.get_mut(user_id) else {
-		return 0;
-	};
+	self.suppressed
+		.clear_room(user_id, room_id, |_| true)
+}
 
-	let mut removed: usize = 0;
-	user_entry.retain(|_, push_entry| {
-		if let Some(queue) = push_entry.rooms.remove(room_id) {
-			removed = removed.saturating_add(queue.len());
-			push_entry.total_events = push_entry
-				.total_events
-				.saturating_sub(queue.len());
-		}
+/// The room's suppressed PDUs, across all pushkeys, each once.
+#[implement(super::Service)]
+pub fn suppressed_room_pdus(&self, user_id: &UserId, room_id: &RoomId) -> Vec<RawPduId> {
+	let inner = self.suppressed.lock();
+	let mut seen = HashSet::new();
+	inner
+		.get(user_id)
+		.into_iter()
+		.flat_map(HashMap::values)
+		.filter_map(|push_entry| push_entry.rooms.get(room_id))
+		.flatten()
+		.map(|event| event.pdu_id)
+		.filter(|pdu_id| seen.insert(*pdu_id))
+		.collect()
+}
 
-		!push_entry.rooms.is_empty()
-	});
-
-	if user_entry.is_empty() {
-		inner.remove(user_id);
-	}
-
-	removed
+/// Clear the given suppressed PDUs of a room (across all pushkeys), keeping
+/// the rest.
+#[implement(super::Service)]
+pub fn clear_suppressed_room_pdus(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	read: &[RawPduId],
+) -> usize {
+	self.suppressed
+		.clear_room(user_id, room_id, |pdu_id| read.contains(pdu_id))
 }
 
 /// Clear suppressed PDUs for a specific pushkey.
@@ -223,4 +269,102 @@ pub fn clear_suppressed_pushkey(&self, user_id: &UserId, pushkey: &str) -> usize
 	}
 
 	removed
+}
+
+#[cfg(test)]
+mod tests {
+	use ruma::{RoomId, UserId};
+	use tuwunel_core::matrix::pdu::{Count, PduId};
+
+	use super::{SuppressedEvent, SuppressedQueue};
+	use crate::rooms::timeline::RawPduId;
+
+	const ROOM: &str = "!room:example.org";
+	const OTHER_ROOM: &str = "!other:example.org";
+	const USER: &str = "@reader:example.org";
+
+	fn pdu_id(count: u64) -> RawPduId {
+		PduId {
+			shortroomid: 7,
+			count: Count::Normal(count),
+		}
+		.into()
+	}
+
+	fn queued(pushkeys: &[&str], rooms: &[(&str, &[u64])]) -> SuppressedQueue {
+		let queue = SuppressedQueue::default();
+		{
+			let mut inner = queue.lock();
+			let user_entry = inner
+				.entry(UserId::parse(USER).unwrap())
+				.or_default();
+
+			for pushkey in pushkeys {
+				let push_entry = user_entry
+					.entry((*pushkey).to_owned())
+					.or_default();
+				for (room, counts) in rooms {
+					let events = counts.iter().map(|&count| SuppressedEvent {
+						pdu_id: pdu_id(count),
+						_inserted_at_ms: 0,
+					});
+
+					push_entry
+						.rooms
+						.entry(RoomId::parse(*room).unwrap())
+						.or_default()
+						.extend(events);
+
+					push_entry.total_events = push_entry
+						.total_events
+						.saturating_add(counts.len());
+				}
+			}
+		}
+
+		queue
+	}
+
+	fn remaining(queue: &SuppressedQueue, pushkey: &str, room: &str) -> Vec<RawPduId> {
+		queue
+			.lock()
+			.get(&UserId::parse(USER).unwrap())
+			.and_then(|user_entry| user_entry.get(pushkey))
+			.and_then(|push_entry| {
+				push_entry
+					.rooms
+					.get(&RoomId::parse(room).unwrap())
+			})
+			.map(|events| events.iter().map(|event| event.pdu_id).collect())
+			.unwrap_or_default()
+	}
+
+	/// A read drops only the pushes it covers, on every pushkey; the rest of
+	/// the room, and other rooms, stay queued.
+	#[test]
+	fn partial_read_keeps_later_pushes() {
+		let queue = queued(&["phone", "laptop"], &[(ROOM, &[10, 20, 30]), (OTHER_ROOM, &[15])]);
+		let user = UserId::parse(USER).unwrap();
+		let room = RoomId::parse(ROOM).unwrap();
+
+		let read = [pdu_id(10), pdu_id(20)];
+		let removed = queue.clear_room(&user, &room, |id| read.contains(id));
+
+		assert_eq!(removed, 4);
+		for pushkey in ["phone", "laptop"] {
+			assert_eq!(remaining(&queue, pushkey, ROOM), vec![pdu_id(30)]);
+			assert_eq!(remaining(&queue, pushkey, OTHER_ROOM), vec![pdu_id(15)]);
+		}
+	}
+
+	/// A full read leaves nothing of the room, and no empty entries behind.
+	#[test]
+	fn full_read_clears_the_room() {
+		let queue = queued(&["phone"], &[(ROOM, &[10, 20])]);
+		let user = UserId::parse(USER).unwrap();
+		let room = RoomId::parse(ROOM).unwrap();
+
+		assert_eq!(queue.clear_room(&user, &room, |_| true), 2);
+		assert!(queue.lock().is_empty());
+	}
 }

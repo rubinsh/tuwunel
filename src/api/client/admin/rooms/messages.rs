@@ -38,6 +38,7 @@ pub(crate) async fn admin_room_messages_route(
 		dir: body.dir.unwrap_or(Direction::Forward),
 		limit: body.limit,
 		filter: &filter,
+		not_rel_types: &[],
 		bypass_visibility: true,
 	})
 	.await?;

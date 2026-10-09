@@ -107,8 +107,9 @@ struct RoomMetadata {
 
 struct UserMetadata {
 	witness: Option<Witness>,
-	#[expect(clippy::option_option)]
-	last_notification_read: Option<Option<u64>>,
+	/// The main read cursor, loaded for every room in the sync: a sync that
+	/// also carries messages must still say when a read reset a count.
+	last_notification_read: Option<u64>,
 	thread_last_reads: Option<BTreeMap<OwnedEventId, u64>>,
 	last_privateread_update: u64,
 	joined_since_last_sync: bool,
@@ -1151,6 +1152,7 @@ async fn load_joined_room(
 		send_notification_count_filter,
 	} = compute_notification_gates(
 		last_notification_read,
+		timeline_pdus.is_empty(),
 		thread_last_reads.as_ref(),
 		since,
 		in_window,
@@ -1921,12 +1923,10 @@ async fn gather_user_metadata(
 			.state_get(shortstatehash, &StateEventType::RoomEncryption, "")
 	});
 
-	let last_notification_read = timeline_pdus.is_empty().then_async(|| {
-		services
-			.pusher
-			.last_notification_read(sender_user, room_id)
-			.ok()
-	});
+	let last_notification_read = services
+		.pusher
+		.last_notification_read(sender_user, room_id)
+		.ok();
 
 	let thread_last_reads = timeline_pdus.is_empty().then_async(|| {
 		services
@@ -1963,16 +1963,16 @@ async fn gather_user_metadata(
 	}
 }
 
-#[expect(clippy::option_option)]
 fn compute_notification_gates(
-	last_notification_read: Option<Option<u64>>,
+	last_notification_read: Option<u64>,
+	timeline_empty: bool,
 	thread_last_reads: Option<&BTreeMap<OwnedEventId, u64>>,
 	since: u64,
 	in_window: impl Fn(u64) -> bool,
 ) -> NotificationGates<impl Fn(&UInt) -> bool> {
-	let send_main_counts = last_notification_read
-		.flatten()
-		.is_none_or(&in_window);
+	// New events can raise a count, so a room with timeline events always
+	// sends its counts; a quiet room only when its read cursor moved.
+	let send_main_counts = !timeline_empty || last_notification_read.is_none_or(&in_window);
 
 	let send_thread_counts =
 		thread_last_reads.is_none_or(|reads| reads.values().copied().any(&in_window));
@@ -1983,9 +1983,13 @@ fn compute_notification_gates(
 	// client.
 	let send_notification_counts = send_main_counts || send_thread_counts;
 
-	let send_notification_resets = last_notification_read
-		.flatten()
-		.is_some_and(|last_count| last_count > since);
+	// A zero is sent only when a read since `since` reset the count, whether
+	// or not the same sync carries events. Gating this on a quiet timeline
+	// dropped the zero of a read that came with a message (an own send, or a
+	// read and a reply together), and the next quiet sync left the room out,
+	// so the client kept the old count.
+	let send_notification_resets =
+		last_notification_read.is_some_and(|last_count| last_count > since);
 
 	let send_notification_count_filter =
 		move |count: &UInt| *count != uint!(0) || send_notification_resets;
@@ -2447,6 +2451,48 @@ mod tests {
 		assert!(matches!(StateAfter::from((true, false)), StateAfter::Stable));
 		assert!(matches!(StateAfter::from((false, true)), StateAfter::Unstable));
 		assert!(matches!(StateAfter::from((true, true)), StateAfter::Unstable));
+	}
+
+	#[test]
+	fn notification_gates_send_a_reset_zero_with_or_without_timeline_events() {
+		let since = 10;
+		let next_batch = 20;
+		let in_window = |count: u64| count > since && count <= next_batch;
+		let zero = uint!(0);
+		let three = uint!(3);
+
+		// (read cursor, timeline empty) -> (counts sent, zero sent, non-zero sent)
+		let cases = [
+			// A read in the window, with a message in the same sync: the zero goes out.
+			((Some(15), false), (true, true, true)),
+			// The same read on a quiet sync.
+			((Some(15), true), (true, true, true)),
+			// No read since `since`, with new events: counts go out, a zero doesn't.
+			((Some(5), false), (true, false, true)),
+			// No read and nothing new: the room's counts are left out.
+			((Some(5), true), (false, false, true)),
+			// Never read: counts with events, never a zero.
+			((None, false), (true, false, true)),
+		];
+		for ((read, timeline_empty), (counts, zero_sent, nonzero_sent)) in cases {
+			// As gathered: the thread cursors are loaded for a quiet sync.
+			let thread_reads = timeline_empty.then(BTreeMap::new);
+			let gates = compute_notification_gates(
+				read,
+				timeline_empty,
+				thread_reads.as_ref(),
+				since,
+				in_window,
+			);
+			let label = format!("read {read:?}, timeline empty {timeline_empty}");
+			assert_eq!(gates.send_notification_counts, counts, "{label}: counts");
+			assert_eq!((gates.send_notification_count_filter)(&zero), zero_sent, "{label}: zero");
+			assert_eq!(
+				(gates.send_notification_count_filter)(&three),
+				nonzero_sent,
+				"{label}: non-zero"
+			);
+		}
 	}
 
 	#[test]

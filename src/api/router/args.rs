@@ -47,6 +47,10 @@ pub(crate) struct Args<T> {
 	/// Parsed JSON content.
 	/// None when body is not a valid string
 	pub(crate) json_body: Option<CanonicalJsonValue>,
+
+	/// The raw `filter` query parameter, for the fields ruma's filter types
+	/// drop, such as MSC3874 `not_rel_types`. None when absent.
+	pub(crate) raw_filter: Option<String>,
 }
 
 impl<T> Args<T> {
@@ -130,6 +134,8 @@ where
 		)
 		.await?;
 
+		let raw_filter = request.query.filter.take();
+
 		Ok(Self {
 			body: make_body::<T>(services, &mut request, json_body.as_mut(), &auth)?,
 			cookie: request.cookie,
@@ -138,6 +144,7 @@ where
 			sender_device: auth.sender_device,
 			appservice_info: auth.appservice_info,
 			json_body,
+			raw_filter,
 		})
 	}
 }

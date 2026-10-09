@@ -12,10 +12,11 @@ use ruma::{
 	},
 	serde::Raw,
 };
+use serde::Deserialize;
 use tuwunel_core::{
 	Err, PduId, Result, at,
 	matrix::{
-		event::{Event, Matches},
+		event::{Event, Matches, RelationTypeEqual},
 		pdu::{PduCount, PduEvent},
 	},
 	ref_at,
@@ -50,6 +51,9 @@ pub(crate) struct MessagesArgs<'a> {
 	pub limit: Option<UInt>,
 	pub filter: &'a RoomEventFilter,
 
+	/// MSC3874 `not_rel_types`: leave out events with these relation types.
+	pub not_rel_types: &'a [RelationType],
+
 	/// Skip the room-visibility gate and the per-event visibility and ignore
 	/// filters, for admin callers that see all history.
 	pub bypass_visibility: bool,
@@ -80,6 +84,32 @@ const IGNORED_MESSAGE_TYPES: &[TimelineEventType] = &[
 /// MSC3440 `related_by_rel_types` entries, typed at the compare boundary.
 type RelTypes = SmallVec<[RelationType; 1]>;
 
+/// The MSC3874 field of a room event filter, which ruma's `RoomEventFilter`
+/// does not carry.
+#[derive(Default, Deserialize)]
+struct NotRelTypes {
+	#[serde(
+		rename = "org.matrix.msc3874.not_rel_types",
+		alias = "not_rel_types",
+		default
+	)]
+	not_rel_types: Vec<String>,
+}
+
+/// MSC3874 `not_rel_types` from a request's raw `filter` parameter, so a
+/// client can page a room's main timeline without its thread replies. A
+/// filter ID, or a filter without the field, excludes nothing.
+pub(crate) fn not_rel_types(raw_filter: Option<&str>) -> RelTypes {
+	raw_filter
+		.and_then(|filter| serde_json::from_str::<NotRelTypes>(filter).ok())
+		.unwrap_or_default()
+		.not_rel_types
+		.iter()
+		.map(String::as_str)
+		.map(RelationType::from)
+		.collect()
+}
+
 const LIMIT_MAX: usize = 1000;
 const LIMIT_DEFAULT: usize = 10;
 
@@ -102,6 +132,7 @@ pub(crate) async fn get_message_events_route(
 		dir: body.dir,
 		limit: Some(body.limit),
 		filter: &body.filter,
+		not_rel_types: &not_rel_types(body.raw_filter.as_deref()),
 		bypass_visibility: false,
 	})
 	.await
@@ -123,6 +154,7 @@ pub(crate) async fn get_messages(
 		dir,
 		limit,
 		filter,
+		not_rel_types,
 		bypass_visibility,
 	} = args;
 
@@ -188,6 +220,11 @@ pub(crate) async fn get_messages(
 	let events: Vec<_> = it
 		.ready_take_while(|(count, _)| Some(*count) != to)
 		.ready_filter_map(|item| event_filter(item, filter))
+		.ready_filter(|(_, pdu)| {
+			!not_rel_types
+				.iter()
+				.any(|rel| rel.relation_type_equal(pdu))
+		})
 		.wide_filter_map(|item| related_by_filter(services, shortroomid, filter, item))
 		.wide_filter_map(|item| event_filters(services, sender_user, item, bypass_visibility))
 		.take(limit)
@@ -470,4 +507,28 @@ fn _is_sorted() {
 		IGNORED_MESSAGE_TYPES.is_sorted(),
 		"IGNORED_MESSAGE_TYPES must be sorted by the developer"
 	);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn not_rel_types_reads_the_msc3874_field_of_a_raw_filter() {
+		let thread = || RelationType::from("m.thread");
+
+		assert_eq!(
+			not_rel_types(Some(r#"{"org.matrix.msc3874.not_rel_types":["m.thread"],"limit":5}"#))
+				.as_slice(),
+			[thread()]
+		);
+		assert_eq!(not_rel_types(Some(r#"{"not_rel_types":["m.thread"]}"#)).as_slice(), [
+			thread()
+		]);
+
+		// A filter without the field, a filter ID, or no filter excludes nothing.
+		assert!(not_rel_types(Some(r#"{"types":["m.room.message"]}"#)).is_empty());
+		assert!(not_rel_types(Some("0")).is_empty());
+		assert!(not_rel_types(None).is_empty());
+	}
 }

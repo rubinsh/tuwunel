@@ -18,6 +18,9 @@ pub(super) struct QueryParams {
 
 	#[serde(rename = "org.matrix.msc3202.device_id")]
 	pub(super) msc3202_device_id: Option<DeviceId>,
+
+	/// The raw `filter` parameter, for the filter fields ruma does not carry.
+	pub(super) filter: Option<String>,
 }
 
 impl QueryParams {

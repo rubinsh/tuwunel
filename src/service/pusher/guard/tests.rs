@@ -312,6 +312,21 @@ fn the_budget_is_counted_as_clients_count_it() {
 }
 
 #[test]
+fn numbers_are_parsed_as_javascript_parses_them() {
+	// Exactly 65,536 bytes as Node counts it. A parser that rounds this
+	// number differently from JavaScript counts one byte more and would drop
+	// the room mute.
+	let content = format!(
+		r#"{{"v":1,"accountLevel":"muted","extra":1.549197886606312e-250,"pad":"{}"}}"#,
+		"x".repeat(MAX_CONTENT_BYTES - 70),
+	);
+	let stored = format!(r#"{{"type":"{DEFAULTS_KEY}","content":{content}}}"#);
+
+	let read = parse_stored::<Defaults>(Some(stored.as_bytes())).into_option();
+	assert_eq!(read.map(|defaults| defaults.account_level), Some(Level::Muted));
+}
+
+#[test]
 fn numbers_and_nulls_follow_the_client_parser() {
 	let defaults = |content: Value| parse::<Defaults>(&content).into_option();
 	let rooms = |content: Value| parse::<Rooms>(&content).into_option();

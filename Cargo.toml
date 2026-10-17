@@ -518,7 +518,9 @@ version = "0.4"
 [workspace.dependencies.serde_json]
 version = "1.0"
 default-features = false
-features = ["raw_value"]
+# float_roundtrip: parse every number to the same double JavaScript does, so
+# the push guard's JSON.stringify byte count matches the clients' count.
+features = ["raw_value", "float_roundtrip"]
 
 [workspace.dependencies.serde_urlencoded]
 version = "0.7"

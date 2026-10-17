@@ -1,11 +1,13 @@
 //! The guard's settings, read from the user's global account data.
 //!
-//! Four keys, each parsed on its own. A key that is missing, too large, of an
-//! unknown version, or with any invalid field yields that key's defaults and
-//! leaves the other keys in force; the one exception is an unusable timezone,
-//! which only turns quiet hours off. The shapes and limits are frozen by the
-//! notification guard spec (§5.7) and pinned by fixtures shared with the
-//! clients that write them.
+//! Four keys, each parsed on its own. A key that is missing, over its size
+//! budget, of an unknown version, or with any invalid field yields that key's
+//! defaults and leaves the other keys in force; the one exception is an
+//! unusable timezone, which only turns quiet hours off. The shapes and limits
+//! are frozen by the notification guard spec (§5.7) and pinned by fixtures
+//! shared with the clients that write them, whose parser this one matches:
+//! numbers are JavaScript numbers (`120.0` is `120`), and `null` is valid only
+//! where the spec shows it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,10 +25,17 @@ pub(super) const SCHEDULE_KEY: &str = "com.chat-harness.notify.schedule";
 pub(super) const BOTS_KEY: &str = "com.chat-harness.notify.bots";
 
 /// The only schema version this guard reads.
-const VERSION: u64 = 1;
+const VERSION: f64 = 1.0;
 
-/// Larger stored values are not parsed, which bounds the work done per push.
-pub(super) const MAX_VALUE_BYTES: usize = 128 * 1024;
+/// A key's `content` may be this large, counted as the UTF-8 length of
+/// `JSON.stringify(content)`; clients refuse to save more. Bounds the work
+/// done per push.
+pub(super) const MAX_CONTENT_BYTES: usize = 65_536;
+
+/// Stored events larger than this are not even parsed. The server may store a
+/// number longer than JavaScript writes it (`-0.0` for `0`), at most 2.5 times
+/// the client's count, so no content within budget can reach this.
+pub(super) const MAX_STORED_BYTES: usize = 256 * 1024;
 
 /// When a present `defaults` key names no burst window.
 const DEFAULT_BURST_WINDOW_SEC: u64 = 120;
@@ -38,8 +47,9 @@ pub(super) const MAX_WINDOWS: usize = 14;
 pub(super) const MAX_BREAK_THROUGH: usize = 200;
 const MAX_BOTS: usize = 500;
 
-/// JavaScript's largest safe integer; clients write times as JS numbers.
+/// JavaScript's largest safe integer; clients write numbers as JS numbers.
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+const MAX_SAFE_FLOAT: f64 = 9_007_199_254_740_991.0;
 
 /// A room's alert level (D2).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -99,11 +109,12 @@ pub(super) struct Rooms {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Room {
-	#[serde(default)]
+	/// Optional, but never `null`.
+	#[serde(default, deserialize_with = "present_level")]
 	pub(super) level: Option<Level>,
 
-	/// Unix ms; a past value is ignored.
-	#[serde(default, deserialize_with = "optional_time")]
+	/// Unix ms; a past value is ignored. Optional, but never `null`.
+	#[serde(default, deserialize_with = "present_time")]
 	pub(super) snooze_until: Option<u64>,
 
 	#[serde(default)]
@@ -219,7 +230,7 @@ pub(super) fn parse_stored<T: DeserializeOwned>(stored: Option<&[u8]>) -> Parsed
 		return Parsed::Absent;
 	};
 
-	if stored.len() > MAX_VALUE_BYTES {
+	if stored.len() > MAX_STORED_BYTES {
 		return Parsed::Degraded("too_large");
 	}
 
@@ -244,24 +255,47 @@ pub(super) fn parse_content<T: DeserializeOwned>(content: Value) -> Parsed<T> {
 		return Parsed::Degraded("unknown_version");
 	}
 
-	match T::deserialize(Value::Object(content)) {
+	let content = Value::Object(content);
+	if js_json_len(&content) > MAX_CONTENT_BYTES {
+		return Parsed::Degraded("too_large");
+	}
+
+	match T::deserialize(content) {
 		| Ok(value) => Parsed::Read(value),
 		| Err(_) => Parsed::Degraded("bad_value"),
 	}
 }
 
-fn version(content: &Map<String, Value>) -> Option<u64> { content.get("v")?.as_u64() }
+fn version(content: &Map<String, Value>) -> Option<f64> { content.get("v")?.as_f64() }
 
-/// A non-negative safe integer: Unix ms, as clients write it.
-pub(super) fn time<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-	let time = u64::deserialize(deserializer)?;
-	if time > MAX_SAFE_INTEGER {
-		return Err(D::Error::custom("time is not a safe integer"));
-	}
+/// A non-negative safe integer, as a JavaScript number carries it: `120` and
+/// `120.0` alike.
+pub(super) fn safe_integer<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+	let number = serde_json::Number::deserialize(deserializer)?;
 
-	Ok(time)
+	number
+		.as_u64()
+		.or_else(|| integral(number.as_f64()?))
+		.filter(|&integer| integer <= MAX_SAFE_INTEGER)
+		.ok_or_else(|| D::Error::custom("not a non-negative safe integer"))
 }
 
+#[expect(
+	clippy::as_conversions,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	reason = "checked to be a whole number in 0..=2^53-1, which u64 holds exactly"
+)]
+fn integral(float: f64) -> Option<u64> {
+	((0.0..=MAX_SAFE_FLOAT).contains(&float) && float.fract() == 0.0).then_some(float as u64)
+}
+
+/// Unix ms.
+pub(super) fn time<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+	safe_integer(deserializer)
+}
+
+/// Unix ms or `null`.
 pub(super) fn optional_time<'de, D: Deserializer<'de>>(
 	deserializer: D,
 ) -> Result<Option<u64>, D::Error> {
@@ -270,8 +304,17 @@ pub(super) fn optional_time<'de, D: Deserializer<'de>>(
 		.transpose()
 }
 
+/// Unix ms where the field may be left out but not set to `null`.
+fn present_time<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+	time(deserializer).map(Some)
+}
+
+fn present_level<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Level>, D::Error> {
+	Level::deserialize(deserializer).map(Some)
+}
+
 fn burst_window<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-	let sec = u64::deserialize(deserializer)?;
+	let sec = safe_integer(deserializer)?;
 	if sec > MAX_BURST_WINDOW_SEC {
 		return Err(D::Error::custom("burst window too long"));
 	}
@@ -311,4 +354,48 @@ where
 	Ok(ids.into_iter().collect())
 }
 
-fn is_id(id: &str, sigil: char) -> bool { id.len() > 1 && id.starts_with(sigil) }
+/// The clients check only the sigil, so the guard does too.
+fn is_id(id: &str, sigil: char) -> bool { id.starts_with(sigil) }
+
+/// The UTF-8 length of `JSON.stringify(value)`: how clients measure a key
+/// against its budget. Counted here rather than by reserializing, since
+/// serde_json writes some numbers differently (`1.0` where JavaScript writes
+/// `1`).
+pub(super) fn js_json_len(value: &Value) -> usize {
+	let joined = |lengths: &mut dyn Iterator<Item = usize>, count: usize| {
+		lengths
+			.fold(2_usize, usize::saturating_add)
+			.saturating_add(count.saturating_sub(1))
+	};
+
+	match value {
+		| Value::Null | Value::Bool(true) => 4,
+		| Value::Bool(false) => 5,
+		| Value::Number(number) => js_number_len(number.as_f64().unwrap_or_default()),
+		| Value::String(string) => js_string_len(string),
+		| Value::Array(items) => joined(&mut items.iter().map(js_json_len), items.len()),
+		| Value::Object(map) => joined(
+			&mut map.iter().map(|(key, value)| {
+				js_string_len(key)
+					.saturating_add(1)
+					.saturating_add(js_json_len(value))
+			}),
+			map.len(),
+		),
+	}
+}
+
+/// A quoted string as `JSON.stringify` escapes it.
+fn js_string_len(string: &str) -> usize {
+	string
+		.chars()
+		.map(|char| match char {
+			| '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+			| char if u32::from(char) < 0x20 => 6,
+			| char => char.len_utf8(),
+		})
+		.fold(2, usize::saturating_add)
+}
+
+/// A number as JavaScript writes it: `1` for `1.0`, `1e+21`, `0.000001`.
+fn js_number_len(float: f64) -> usize { ryu_js::Buffer::new().format(float).len() }

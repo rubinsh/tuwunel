@@ -37,8 +37,9 @@ The first rule that matches drops the push.
 
 The effective level is the room's own `level`. If the room has none, it is
 `botRoomLevel` when that is set and every other joined member is on the bot
-list; otherwise it is `accountLevel`. Rooms with more than 64 other members are
-never bot rooms, which bounds the member scan.
+list; otherwise it is `accountLevel`. The member scan stops after one more
+member than the bot list holds (at most 501), since a larger room cannot be a
+bot room.
 
 All times are judged when the guard decides, not by `origin_server_ts`, so an
 old event flushed at night is judged at night.
@@ -47,8 +48,16 @@ old event flushed at night is judged at night.
 
 The guard reads four global account-data keys of the pushing user:
 `com.chat-harness.notify.defaults`, `.rooms`, `.schedule` and `.bots`. Each
-key falls back to its own defaults when it is absent, over 128 KiB, of a `v`
-other than 1, or has any invalid field. A missing or unknown timezone only
+key falls back to its own defaults when it is absent, over its size budget, of
+a `v` other than 1, or has any invalid field. The parser matches the app's
+field by field: numbers are JavaScript numbers (`120.0` is `120`), `null` is
+valid only where the spec shows it, and IDs are checked by their sigil.
+
+The size budget is 65,536 bytes of `content`, counted as the UTF-8 length of
+`JSON.stringify(content)`, which is how the app measures a value before it
+saves it; the server computes that count itself, number formatting included,
+rather than reserializing. Stored events over 256 KiB are not parsed at all;
+no content within budget can be stored that large. A missing or unknown timezone only
 turns quiet hours off. Zone and link names match in any case (`utc`,
 `us/eastern`); offsets such as `+01:00` are not names. The parser runs the shared fixture file
 (`src/service/pusher/guard/fixtures/parse-cases.json`) in its unit tests.
@@ -82,10 +91,13 @@ All guard state is in memory. It is bounded, and it errs towards alerting:
 - **Drops:** `(user, pushkey, event)` stays dropped for 24 h. At most 65,536
   are kept; the oldest go first. A restart forgets them, so an event retried
   after a restart is judged again.
-- **Burst slots:** one per pusher and room. A slot is taken when the guard
-  decides to send, and released if the gateway call fails, so a retry still
-  alerts. At most 16,384 are kept; past that, expired slots are reaped first,
-  then all of them. A restart costs at most one extra alert per room.
+- **Burst slots:** one per pusher and room, holding the event and when it was
+  admitted. Its age is judged against the window in force at each decision,
+  so a changed window applies at once. A slot is taken when the guard decides
+  to send, and released if the gateway call fails, so a retry still alerts.
+  At most 16,384 are kept; past that, slots older than the longest allowed
+  window (24 h) are reaped first, then all of them. A restart costs at most
+  one extra alert per room.
 - **Activity:** one record per device. Ordering records outlive the claim by
   24 h, up to 16,384 devices; past that, the least recently reported go first.
   A restart ends every claim early.

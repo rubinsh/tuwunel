@@ -30,7 +30,7 @@ use tuwunel_core::{
 	Err, Result, err,
 	matrix::{Pdu, PduCount, PduId, RawPduId},
 	ruma::{
-		DeviceId, OwnedRoomId, OwnedUserId, UserId,
+		DeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 		api::client::push::{
 			Pusher, PusherIds, PusherInit, PusherKind,
 			set_pusher::v3::Request as SetPusherRequest,
@@ -161,6 +161,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	failed_sends_keep_their_alert(&fx).await?;
 	room_levels(&fx).await?;
 	bot_rooms_take_the_bot_room_default(&fx).await?;
+	large_bot_rooms(&fx).await?;
 	pause_and_quiet_hours(&fx).await?;
 	active_device_suppression(&fx).await?;
 	activity_endpoint_errors(&fx).await?;
@@ -344,6 +345,50 @@ async fn bot_rooms_take_the_bot_room_default(fx: &Fixture<'_>) -> Result {
 		.await
 }
 
+/// A room of many listed bots is still a bot room, and stops being one when
+/// an unlisted human joins.
+async fn large_bot_rooms(fx: &Fixture<'_>) -> Result {
+	const BOTS: usize = 65;
+
+	let room = fx.create_room().await?;
+	let mut bots = Vec::with_capacity(BOTS);
+	for n in 0..BOTS {
+		let token = format!("notify-guard-test-many-bots-access-token-{n}");
+		let bot =
+			register(fx.services, &format!("many-bot-{n}"), &[(device_id!("MANY"), &token)])
+				.await?;
+		fx.join(&room, &token).await?;
+		bots.push(bot);
+	}
+
+	fx.settings("com.chat-harness.notify.bots", json!({ "v": 1, "users": bots }))
+		.await?;
+	let defaults = json!({ "v": 1, "burstWindowSec": 0, "botRoomLevel": "mentions" });
+	fx.settings("com.chat-harness.notify.defaults", defaults)
+		.await?;
+
+	let mut gw = fx
+		.gateway("pk-many-bots", device_id!("PHONE"), 0)
+		.await?;
+	let from_bot = |id: &str| message_in(&room, id, bots[0].as_str(), json!({ "body": "hi" }));
+
+	fx.push(&gw, &from_bot("$many-bots:x")).await?;
+	expect_nothing(&mut gw, "a plain message in a room of 65 listed bots")?;
+
+	let human = "notify-guard-test-human-access-token";
+	register(fx.services, "human", &[(device_id!("HUMAN"), human)]).await?;
+	fx.join(&room, human).await?;
+
+	fx.push(&gw, &from_bot("$many-bots-human:x"))
+		.await?;
+	expect_delivered(&mut gw, "$many-bots-human:x")?;
+
+	fx.settings("com.chat-harness.notify.bots", json!({ "v": 1, "users": [] }))
+		.await?;
+	fx.settings("com.chat-harness.notify.defaults", json!({ "v": 1, "burstWindowSec": 0 }))
+		.await
+}
+
 async fn pause_and_quiet_hours(fx: &Fixture<'_>) -> Result {
 	let mut gw = fx
 		.gateway("pk-schedule", device_id!("PHONE"), 0)
@@ -474,22 +519,7 @@ async fn deferred_flush_is_guarded(fx: &Fixture<'_>) -> Result {
 
 impl Fixture<'_> {
 	fn message(&self, event_id: &str, sender: &str, content: Value) -> Pdu {
-		let mut content = content;
-		content["msgtype"] = json!("m.text");
-
-		serde_json::from_value(json!({
-			"type": "m.room.message",
-			"content": content,
-			"event_id": event_id,
-			"room_id": self.room,
-			"sender": sender,
-			"prev_events": ["$prev:remote.example"],
-			"auth_events": ["$auth:remote.example"],
-			"origin_server_ts": 1_838_188_000,
-			"depth": 12,
-			"hashes": { "sha256": "thishashcoversallfieldsincasethisisredacted" },
-		}))
-		.expect("a valid test event")
+		message_in(&self.room, event_id, sender, content)
 	}
 
 	/// Store a message so the deferred queue can load it by its PDU id.
@@ -532,6 +562,35 @@ impl Fixture<'_> {
 			| true => expect_delivered(gw, event_id),
 			| false => expect_nothing(gw, event_id),
 		}
+	}
+
+	async fn create_room(&self) -> Result<OwnedRoomId> {
+		let url = format!("{}/_matrix/client/v3/createRoom", self.base);
+		let created = http(self.services, "POST", &url)
+			.bearer_auth(PC_TOKEN)
+			.json(&json!({ "preset": "public_chat" }))
+			.send()
+			.await?
+			.error_for_status()?
+			.json::<Value>()
+			.await?;
+
+		Ok(created["room_id"]
+			.as_str()
+			.ok_or_else(|| err!("createRoom returned no room_id"))?
+			.try_into()?)
+	}
+
+	async fn join(&self, room: &RoomId, token: &str) -> Result {
+		let url = format!("{}/_matrix/client/v3/join/{room}", self.base);
+		http(self.services, "POST", &url)
+			.bearer_auth(token)
+			.json(&json!({}))
+			.send()
+			.await?
+			.error_for_status()?;
+
+		Ok(())
 	}
 
 	/// Write one guard settings key as the PC would.
@@ -611,6 +670,25 @@ impl Fixture<'_> {
 
 		Ok(Gateway { pusher, rx, _stub: stub })
 	}
+}
+
+fn message_in(room: &RoomId, event_id: &str, sender: &str, content: Value) -> Pdu {
+	let mut content = content;
+	content["msgtype"] = json!("m.text");
+
+	serde_json::from_value(json!({
+		"type": "m.room.message",
+		"content": content,
+		"event_id": event_id,
+		"room_id": room,
+		"sender": sender,
+		"prev_events": ["$prev:remote.example"],
+		"auth_events": ["$auth:remote.example"],
+		"origin_server_ts": 1_838_188_000,
+		"depth": 12,
+		"hashes": { "sha256": "thishashcoversallfieldsincasethisisredacted" },
+	}))
+	.expect("a valid test event")
 }
 
 fn expect_delivered(gw: &mut Gateway, event_id: &str) -> Result {

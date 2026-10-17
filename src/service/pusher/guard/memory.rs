@@ -17,9 +17,13 @@ pub(super) const DROP_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// The most drops remembered at once; the oldest go first.
 pub(super) const DROP_CAP: usize = 65_536;
 
-/// The most burst slots held at once. Past it, expired slots are reaped, and
-/// if that is not enough every slot is released.
+/// The most burst slots held at once. Past it, slots older than the longest
+/// window a client may set are reaped, and if that is not enough every slot is
+/// released.
 pub(super) const BURST_CAP: usize = 16_384;
+
+/// The longest burst window a client may set, in ms.
+const MAX_BURST_WINDOW_MS: u64 = 86_400_000;
 
 /// One pusher of one user: `(user, pushkey)`.
 type PusherKey = (OwnedUserId, String);
@@ -36,11 +40,13 @@ struct Dropped {
 	order: VecDeque<((PusherKey, OwnedEventId), u64)>,
 }
 
-/// The event that last alerted for one pusher and room.
+/// The event that last alerted for one pusher and room, and when. Its age is
+/// judged against the window in force at each decision, so a changed window
+/// applies at once.
 #[derive(Clone, Debug)]
 struct Slot {
 	event_id: OwnedEventId,
-	until_ms: u64,
+	at_ms: u64,
 }
 
 /// Whether a burst check let the event through.
@@ -112,7 +118,7 @@ impl Memory {
 		let mut bursts = lock(&self.bursts);
 
 		if let Some(slot) = bursts.get(&key)
-			&& slot.until_ms > now_ms
+			&& now_ms.saturating_sub(slot.at_ms) < window_ms
 		{
 			// The holder keeps its slot as it was: a retry does not extend it.
 			return match slot.event_id == event_id {
@@ -122,7 +128,7 @@ impl Memory {
 		}
 
 		if bursts.len() >= BURST_CAP && !bursts.contains_key(&key) {
-			bursts.retain(|_, slot| slot.until_ms > now_ms);
+			bursts.retain(|_, slot| now_ms.saturating_sub(slot.at_ms) < MAX_BURST_WINDOW_MS);
 			if bursts.len() >= BURST_CAP {
 				bursts.clear();
 			}
@@ -130,7 +136,7 @@ impl Memory {
 
 		bursts.insert(key, Slot {
 			event_id: event_id.to_owned(),
-			until_ms: now_ms.saturating_add(window_ms),
+			at_ms: now_ms,
 		});
 
 		Burst::Taken

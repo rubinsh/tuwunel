@@ -12,14 +12,15 @@ use super::{
 	memory::{BURST_CAP, Burst, DROP_CAP, DROP_TTL_MS, Memory},
 	schedule::Schedule,
 	settings::{
-		BOTS_KEY, Bots, DEFAULTS_KEY, Defaults, Level, MAX_VALUE_BYTES, Parsed, ROOMS_KEY, Rooms,
-		SCHEDULE_KEY, Settings, parse_content, parse_stored,
+		BOTS_KEY, Bots, DEFAULTS_KEY, Defaults, Level, MAX_CONTENT_BYTES, MAX_STORED_BYTES,
+		Parsed, ROOMS_KEY, Rooms, SCHEDULE_KEY, Settings, js_json_len, parse_content,
+		parse_stored,
 	},
 };
 
 /// Shared with the client team: every case must parse the same on both sides.
 /// Copied from `docs/notify-guard/fixtures/parse-cases.json` at
-/// Hepi420/matrix-bot-web-client@6ac74c4c52b82425ef8f546d9cc7baa362b26fbe.
+/// Hepi420/matrix-bot-web-client@125431a7856d5efba9f241369c2beac9e8db81da.
 const PARSE_CASES: &str = include_str!("fixtures/parse-cases.json");
 
 fn parse<T: DeserializeOwned>(content: &Value) -> Parsed<T> {
@@ -27,6 +28,15 @@ fn parse<T: DeserializeOwned>(content: &Value) -> Parsed<T> {
 		| Value::Null => Parsed::Absent,
 		| content => parse_content(content.clone()),
 	}
+}
+
+/// Parse as the guard does: from the stored account-data event.
+fn parse_as_stored<T: DeserializeOwned>(key: &str, content: &Value) -> Parsed<T> {
+	let stored = (!content.is_null()).then(|| {
+		serde_json::to_vec(&json!({ "type": key, "content": content })).expect("serializes")
+	});
+
+	parse_stored(stored.as_deref())
 }
 
 fn level(level: Level) -> &'static str {
@@ -49,7 +59,7 @@ fn clock(minutes: u32) -> String { format!("{:02}:{:02}", minutes / 60, minutes 
 /// What the guard parsed, in the fixtures' shape.
 fn normalized(key: &str, content: &Value) -> Value {
 	match key {
-		| DEFAULTS_KEY => match parse::<Defaults>(content).into_option() {
+		| DEFAULTS_KEY => match parse_as_stored::<Defaults>(key, content).into_option() {
 			| None => json!({
 				"v": 1, "updatedAt": 0, "accountLevel": "all", "botRoomLevel": null,
 				"burstWindowSec": 0, "activeDeviceSuppression": false,
@@ -62,7 +72,9 @@ fn normalized(key: &str, content: &Value) -> Value {
 			}),
 		},
 		| ROOMS_KEY => {
-			let rooms: Rooms = parse(content).into_option().unwrap_or_default();
+			let rooms: Rooms = parse_as_stored(key, content)
+				.into_option()
+				.unwrap_or_default();
 			let entries: Map<String, Value> = rooms
 				.rooms
 				.iter()
@@ -82,12 +94,17 @@ fn normalized(key: &str, content: &Value) -> Value {
 			json!({ "v": 1, "updatedAt": rooms.updated_at, "rooms": entries })
 		},
 		| SCHEDULE_KEY => {
-			let schedule: Schedule = parse(content).into_option().unwrap_or_default();
+			let schedule: Schedule = parse_as_stored(key, content)
+				.into_option()
+				.unwrap_or_default();
 			let windows: Vec<Value> = schedule
 				.quiet_hours
 				.iter()
 				.map(|window| {
-					let days: Vec<usize> = (0..7).filter(|&day| window.days[day]).collect();
+					let days: Vec<f64> = (0_u8..7)
+						.filter(|&day| window.days[usize::from(day)])
+						.map(f64::from)
+						.collect();
 					json!({ "days": days, "start": clock(window.start), "end": clock(window.end) })
 				})
 				.collect();
@@ -103,7 +120,9 @@ fn normalized(key: &str, content: &Value) -> Value {
 			})
 		},
 		| BOTS_KEY => {
-			let bots: Bots = parse(content).into_option().unwrap_or_default();
+			let bots: Bots = parse_as_stored(key, content)
+				.into_option()
+				.unwrap_or_default();
 			json!({ "v": 1, "updatedAt": bots.updated_at, "users": sorted(&bots.users) })
 		},
 		| key => panic!("fixture names an unknown key {key}"),
@@ -148,6 +167,24 @@ fn expected(key: &str, expected: &Value) -> Value {
 				"rooms": ids(through.get("rooms")),
 				"users": ids(through.get("users")),
 			});
+
+			// The guard keeps a window's days as a set: a repeated day changes
+			// nothing it decides.
+			for window in expected["quietHours"]
+				.as_array_mut()
+				.into_iter()
+				.flatten()
+			{
+				let mut days: Vec<f64> = window["days"]
+					.as_array()
+					.into_iter()
+					.flatten()
+					.filter_map(Value::as_f64)
+					.collect();
+				days.sort_by(f64::total_cmp);
+				days.dedup();
+				window["days"] = json!(days);
+			}
 		},
 		| BOTS_KEY => expected["users"] = ids(expected.get("users")),
 		| _ => {},
@@ -163,7 +200,8 @@ fn shared_parse_cases() {
 		.as_array()
 		.expect("cases is a list");
 
-	assert!(cases.len() >= 35, "fixture file lost cases");
+	assert!(cases.len() >= 52, "fixture file lost cases");
+	assert_eq!(fixtures["byteBudget"]["limit"], json!(MAX_CONTENT_BYTES));
 	for case in cases {
 		let name = case["name"].as_str().expect("case has a name");
 		let key = case["key"].as_str().expect("case has a key");
@@ -190,8 +228,139 @@ fn stored_events_wrap_the_value_in_content() {
 	assert!(matches!(parse_stored::<Defaults>(None), Parsed::Absent));
 	assert_eq!(parse_stored::<Defaults>(Some(b"{")).degraded(), Some("not_json"));
 
-	let huge = json!({ "v": 1, "pad": "x".repeat(MAX_VALUE_BYTES) });
-	assert_eq!(parse_stored::<Defaults>(Some(&stored(huge))).degraded(), Some("too_large"));
+	let huge = vec![b' '; MAX_STORED_BYTES + 1];
+	assert_eq!(parse_stored::<Defaults>(Some(&huge)).degraded(), Some("too_large"));
+}
+
+/// `JSON.stringify(value)` and its UTF-8 length, as Node writes them.
+const JS_LENGTHS: &[(&str, usize)] = &[
+	("0", 1),
+	("-0.0", 1),
+	("1.0", 1),
+	("1.5", 3),
+	("120.0", 3),
+	("-7", 2),
+	("1e21", 5),
+	("1E-7", 4),
+	("0.000001", 8),
+	("123456789012345678901", 21),
+	("9007199254740993", 16),
+	("1.2345e-5", 11),
+	("5e-324", 6),
+	("1.7976931348623157e308", 23),
+	("0.1", 3),
+	("1e2", 3),
+	("1e20", 21),
+	(r#""é""#, 4),
+	(r#""😀""#, 6),
+	(r#""\u0001""#, 8),
+	(r#""\n""#, 4),
+	(r#""\"""#, 4),
+	(r#""\\""#, 4),
+	(r#""\u2028""#, 5),
+	(r#""\u007f""#, 3),
+	(r#""a\tb""#, 6),
+	("[]", 2),
+	("{}", 2),
+	(r#"[1,"x",null,true,false]"#, 23),
+	(r#"{"a":1.0,"b":[1.5,"é"]}"#, 22),
+];
+
+#[test]
+fn content_is_measured_as_json_stringify_writes_it() {
+	for &(json, want) in JS_LENGTHS {
+		let value: Value = serde_json::from_str(json).expect("vector is json");
+		assert_eq!(js_json_len(&value), want, "JSON.stringify({json})");
+	}
+}
+
+/// A `defaults` value padded with an ignored field to `size` bytes as a
+/// client counts them, with `v` written as `1.0`, which serde_json would
+/// count two bytes longer.
+fn padded_defaults(size: usize) -> Value {
+	let mut value = json!({ "v": 1.0, "pad": "" });
+	let pad = size
+		.checked_sub(js_json_len(&value))
+		.expect("room to pad");
+	let mut pad_text = "é".repeat(pad / 2);
+	pad_text.push_str(&"x".repeat(pad % 2));
+	value["pad"] = json!(pad_text);
+	assert_eq!(js_json_len(&value), size);
+	value
+}
+
+#[test]
+fn the_budget_is_counted_as_clients_count_it() {
+	let stored = |content: Value| {
+		serde_json::to_vec(&json!({ "type": DEFAULTS_KEY, "content": content })).unwrap()
+	};
+
+	let at_budget = stored(padded_defaults(MAX_CONTENT_BYTES));
+	assert!(matches!(parse_stored::<Defaults>(Some(&at_budget)), Parsed::Read(_)));
+
+	let over = stored(padded_defaults(MAX_CONTENT_BYTES + 1));
+	assert_eq!(parse_stored::<Defaults>(Some(&over)).degraded(), Some("too_large"));
+
+	// The largest stored form of content within budget stays under the outer
+	// limit: every number written `-0.0` where JavaScript writes `0`.
+	let zeros: Vec<Value> = vec![json!(-0.0); (MAX_CONTENT_BYTES - 20) / 2];
+	let content = json!({ "v": 1, "pad": zeros });
+	assert!(js_json_len(&content) <= MAX_CONTENT_BYTES);
+	let stored = stored(content);
+	assert!(stored.len() < MAX_STORED_BYTES, "stored {} bytes", stored.len());
+	assert!(matches!(parse_stored::<Defaults>(Some(&stored)), Parsed::Read(_)));
+}
+
+#[test]
+fn numbers_and_nulls_follow_the_client_parser() {
+	let defaults = |content: Value| parse::<Defaults>(&content).into_option();
+	let rooms = |content: Value| parse::<Rooms>(&content).into_option();
+	let schedule = |content: Value| parse::<Schedule>(&content).into_option();
+
+	// JavaScript numbers: a whole float is an integer.
+	let read = defaults(json!({ "v": 1.0, "burstWindowSec": 120.0, "updatedAt": 5.0 }));
+	assert_eq!(read.map(|d| d.burst_window_sec), Some(120));
+	assert!(defaults(json!({ "v": 1, "burstWindowSec": 1.5 })).is_none());
+	assert!(defaults(json!({ "v": 1, "updatedAt": 9_007_199_254_740_992_u64 })).is_none());
+	assert!(defaults(json!({ "v": 1, "updatedAt": -1 })).is_none());
+
+	// `null` only where the spec shows it.
+	assert!(defaults(json!({ "v": 1, "botRoomLevel": null })).is_some());
+	assert!(rooms(json!({ "v": 1, "rooms": { "!a:x": { "level": null } } })).is_none());
+	assert!(rooms(json!({ "v": 1, "rooms": { "!a:x": { "snoozeUntil": null } } })).is_none());
+	assert!(schedule(json!({ "v": 1, "pauseUntil": null })).is_some());
+
+	// The clients check only an ID's sigil.
+	let bare = rooms(json!({ "v": 1, "rooms": { "!": { "mutedThreads": ["$"] } } }));
+	assert!(bare.is_some_and(|rooms| rooms.rooms.contains_key("!")));
+
+	// One to seven days, repeats included; whole-number floats count.
+	let window = |days: Value| {
+		schedule(json!({
+			"v": 1, "timezone": "UTC",
+			"quietHours": [{ "days": days, "start": "22:00", "end": "07:00" }],
+		}))
+	};
+	assert!(window(json!([1, 1, 1, 1, 1, 1, 1])).is_some());
+	assert!(window(json!([1, 1, 1, 1, 1, 1, 1, 1])).is_none());
+	assert!(window(json!([1.0])).is_some());
+
+	// A valid timezone is kept even with no quiet hours.
+	let zone = schedule(json!({ "v": 1, "timezone": "UTC" })).unwrap();
+	assert_eq!(zone.timezone.map(|zone| zone.name), Some("UTC".to_owned()));
+	assert!(!zone.timezone_dropped);
+
+	// Clock times: exactly HH:MM, 00:00 to 23:59.
+	let clock = |time: &str| {
+		schedule(json!({
+			"v": 1, "timezone": "UTC",
+			"quietHours": [{ "days": [1], "start": time, "end": "07:00" }],
+		}))
+		.is_some()
+	};
+	assert!(clock("00:00") && clock("23:59") && clock("09:05"));
+	assert!(!clock("24:00") && !clock("9:05") && !clock(" 9:05") && !clock("09:60"));
+	assert!(!clock("09:5 ") && !clock("０9:05") && !clock("09-05"));
 }
 
 #[test]
@@ -405,19 +574,58 @@ fn a_failed_send_releases_its_burst_slot() {
 }
 
 #[test]
-fn burst_slots_are_bounded() {
+fn a_changed_burst_window_applies_at_once() {
 	let memory = Memory::default();
-	let user = user_id!("@u:x");
+	let (user, room) = (user_id!("@u:x"), room_id!("!r:x"));
+	let take = |event: &str, window_sec: u64, now_sec: u64| {
+		memory.take_burst(
+			user,
+			"pk",
+			room,
+			event.try_into().unwrap(),
+			window_sec * 1000,
+			now_sec * 1000,
+		)
+	};
 
-	for n in 0..BURST_CAP {
-		let room = format!("!r{n}:x");
-		let room = room.as_str().try_into().unwrap();
-		memory.take_burst(user, "pk", room, event_id!("$e"), 10, 0);
-	}
-	assert_eq!(memory.sizes().2, BURST_CAP);
+	// Alert at 1 s under a 120 s window, then the window shrinks to 30 s.
+	assert_eq!(take("$a", 120, 1), Burst::Taken);
+	assert_eq!(take("$b", 30, 61), Burst::Taken, "60 s on, outside the new window");
 
-	memory.take_burst(user, "pk", room_id!("!new:x"), event_id!("$e"), 10, 10);
-	assert_eq!(memory.sizes().2, 1, "expired slots were reaped");
+	// Alert at 200 s under 120 s, then the window grows to 300 s.
+	assert_eq!(take("$c", 120, 200), Burst::Taken);
+	assert_eq!(take("$d", 300, 350), Burst::Held, "150 s on, inside the new window");
+}
+
+#[test]
+fn burst_slots_are_bounded() {
+	let fill = |memory: &Memory| {
+		for n in 0..BURST_CAP {
+			let room = format!("!r{n}:x");
+			let room = room.as_str().try_into().unwrap();
+			memory.take_burst(user_id!("@u:x"), "pk", room, event_id!("$e"), 10, 0);
+		}
+		assert_eq!(memory.sizes().2, BURST_CAP);
+	};
+
+	// Slots older than any window a client may set are reaped.
+	let memory = Memory::default();
+	fill(&memory);
+	memory.take_burst(
+		user_id!("@u:x"),
+		"pk",
+		room_id!("!new:x"),
+		event_id!("$e"),
+		10,
+		86_400_000,
+	);
+	assert_eq!(memory.sizes().2, 1);
+
+	// Slots that could still be inside a window are all released at the cap.
+	let memory = Memory::default();
+	fill(&memory);
+	memory.take_burst(user_id!("@u:x"), "pk", room_id!("!new:x"), event_id!("$e"), 10, 10);
+	assert_eq!(memory.sizes().2, 1);
 }
 
 #[test]

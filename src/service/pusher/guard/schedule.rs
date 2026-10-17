@@ -8,11 +8,12 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Datelike, NaiveTime, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, Timelike, Utc, Weekday};
 use chrono_tz::{TZ_VARIANTS, Tz};
 use serde::{Deserialize, Deserializer, de::Error as _};
+use serde_json::Value;
 
-use super::settings::{MAX_BREAK_THROUGH, MAX_WINDOWS, ids, optional_time, time};
+use super::settings::{MAX_BREAK_THROUGH, MAX_WINDOWS, ids, optional_time, safe_integer, time};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(from = "Stored")]
@@ -103,8 +104,7 @@ impl From<Stored> for Schedule {
 	fn from(stored: Stored) -> Self {
 		let timezone = stored
 			.timezone
-			.and_then(|name| Some(Zone { tz: zone(&name)?, name }))
-			.filter(|_| !stored.quiet_hours.is_empty());
+			.and_then(|name| Some(Zone { tz: zone(&name)?, name }));
 
 		let timezone_dropped = timezone.is_none() && !stored.quiet_hours.is_empty();
 
@@ -201,16 +201,20 @@ fn windows<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Window>, D:
 	Ok(windows)
 }
 
+/// One to seven entries, each 0 (Sunday) to 6; repeats count towards the
+/// seven.
 fn days<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[bool; 7], D::Error> {
-	let listed = Vec::<u8>::deserialize(deserializer)?;
-	if listed.is_empty() {
-		return Err(D::Error::custom("a window needs a day"));
+	let listed = Vec::<Value>::deserialize(deserializer)?;
+	if listed.is_empty() || listed.len() > 7 {
+		return Err(D::Error::custom("a window has one to seven days"));
 	}
 
 	let mut days = [false; 7];
 	for day in listed {
-		let slot = days
-			.get_mut(usize::from(day))
+		let day = safe_integer(day).map_err(D::Error::custom)?;
+		let slot = usize::try_from(day)
+			.ok()
+			.and_then(|day| days.get_mut(day))
 			.ok_or_else(|| D::Error::custom("day out of range"))?;
 
 		*slot = true;
@@ -219,18 +223,26 @@ fn days<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[bool; 7], D::Erro
 	Ok(days)
 }
 
-/// `HH:MM`, 24-hour, as minutes after midnight.
+/// `HH:MM`, exactly two digits each, 00:00 to 23:59, as minutes after
+/// midnight.
 fn clock<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
 	let text = String::deserialize(deserializer)?;
-	if text.len() != 5 {
-		return Err(D::Error::custom("time is not HH:MM"));
-	}
 
-	let time = NaiveTime::parse_from_str(&text, "%H:%M")
-		.map_err(|_| D::Error::custom("time is not HH:MM"))?;
+	minutes(&text).ok_or_else(|| D::Error::custom("time is not HH:MM"))
+}
 
-	Ok(time
-		.hour()
-		.saturating_mul(60)
-		.saturating_add(time.minute()))
+fn minutes(text: &str) -> Option<u32> {
+	let digit = |byte: u8| char::from(byte).to_digit(10);
+	let &[h1, h2, b':', m1, m2] = text.as_bytes() else {
+		return None;
+	};
+
+	let hour = digit(h1)?
+		.checked_mul(10)?
+		.checked_add(digit(h2)?)?;
+	let minute = digit(m1)?
+		.checked_mul(10)?
+		.checked_add(digit(m2)?)?;
+
+	(hour < 24 && minute < 60).then(|| hour.saturating_mul(60).saturating_add(minute))
 }

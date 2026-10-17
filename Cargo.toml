@@ -118,6 +118,9 @@ version = "0.4"
 features = ["alloc", "std"]
 default-features = false
 
+[workspace.dependencies.ryu-js]
+version = "1.0"
+
 [workspace.dependencies.chrono-tz]
 version = "0.10"
 default-features = false

@@ -34,10 +34,6 @@ use self::{
 	},
 };
 
-/// A room with more other members than this is never treated as a bot room,
-/// which bounds the member scan done per push.
-const MAX_BOT_ROOM_MEMBERS: usize = 64;
-
 #[derive(Default)]
 pub(super) struct Guard {
 	memory: Memory,
@@ -304,10 +300,13 @@ async fn guard_key<T: DeserializeOwned>(&self, user_id: &UserId, key: &'static s
 	parsed
 }
 
-/// A bot room (D11): every other joined member is on the bot list.
+/// A bot room (D11): every other joined member is on the bot list. A room
+/// with more other members than the list has names cannot be one, so the scan
+/// reads at most one more member than that: 501 at the list's cap.
 #[implement(super::Service)]
 async fn is_bot_room(&self, user_id: &UserId, room_id: &RoomId, settings: &Settings) -> bool {
-	if settings.bots.users.is_empty() {
+	let bots = settings.bots.users.len();
+	if bots == 0 {
 		return false;
 	}
 
@@ -317,12 +316,12 @@ async fn is_bot_room(&self, user_id: &UserId, room_id: &RoomId, settings: &Setti
 		.room_members(room_id)
 		.ready_filter(|member| *member != user_id)
 		.map(ToOwned::to_owned)
-		.take(MAX_BOT_ROOM_MEMBERS.saturating_add(1))
+		.take(bots.saturating_add(1))
 		.collect()
 		.await;
 
 	!others.is_empty()
-		&& others.len() <= MAX_BOT_ROOM_MEMBERS
+		&& others.len() <= bots
 		&& others
 			.iter()
 			.all(|member| settings.is_bot(member.as_str()))

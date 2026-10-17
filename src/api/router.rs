@@ -414,6 +414,7 @@ fn register_client_misc_routes(router: Router<State>) -> Router<State> {
 		.ruma_route(&client::well_known_support)
 		.route("/.well-known/matrix/client", get(client::well_known_client))
 		.ruma_route(&client::tuwunel_remote_version)
+		.ruma_route(&client::notify_activity_route)
 		.route("/_tuwunel/server_version", get(client::tuwunel_server_version))
 		.route(
 			"/_tuwunel/ephemeral/{event_type}/{room_id}",

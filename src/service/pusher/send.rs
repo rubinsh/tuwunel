@@ -17,7 +17,7 @@ use serde_json::Value;
 use tuwunel_core::{Result, err, error, implement, matrix::Event, trace, utils::BoolExt};
 use url::Url;
 
-use super::Evaluate;
+use super::{Evaluate, guard::Verdict};
 
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip_all)]
@@ -66,20 +66,31 @@ where
 		"Push notice decision",
 	);
 
-	if notify || self.services.config.push_everything {
-		let tweaks: Vec<Tweak> = actions
-			.iter()
-			.filter_map(|action| match action {
-				| Action::SetTweak(tweak) => Some(tweak.clone()),
-				| _ => None,
-			})
-			.collect();
-
-		self.send_notice(user_id, pusher, tweaks, event)
-			.await?;
+	if !notify && !self.services.config.push_everything {
+		return Ok(());
 	}
 
-	Ok(())
+	let Verdict::Send { burst } = self.guard_notice(user_id, pusher, event).await else {
+		return Ok(());
+	};
+
+	let tweaks: Vec<Tweak> = actions
+		.iter()
+		.filter_map(|action| match action {
+			| Action::SetTweak(tweak) => Some(tweak.clone()),
+			| _ => None,
+		})
+		.collect();
+
+	let sent = self
+		.send_notice(user_id, pusher, tweaks, event)
+		.await;
+
+	if sent.is_err() && burst {
+		self.guard_send_failed(user_id, pusher, event);
+	}
+
+	sent
 }
 
 /// Send an account-wide counts-only notification to a push gateway.

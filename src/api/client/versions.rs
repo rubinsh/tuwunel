@@ -81,8 +81,11 @@ static VERSIONS: [&str; 27] = [
 	"v1.19",  /* mutual rooms (MSC2666) */
 ];
 
-static UNSTABLE_FEATURES: [&str; 38] = [
+static UNSTABLE_FEATURES: [&str; 39] = [
 	"org.matrix.e2e_cross_signing",
+	// Chat Harness notification guard and its activity endpoint
+	// (docs/design/notification-guard.md)
+	"com.chat-harness.notify_guard",
 	// private read receipts (https://github.com/matrix-org/matrix-spec-proposals/pull/2285)
 	"org.matrix.msc2285.stable",
 	// appservice ping https://github.com/matrix-org/matrix-spec-proposals/pull/2659)

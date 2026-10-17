@@ -118,6 +118,14 @@ version = "0.4"
 features = ["alloc", "std"]
 default-features = false
 
+[workspace.dependencies.ryu-js]
+version = "1.0"
+
+[workspace.dependencies.chrono-tz]
+version = "0.10"
+default-features = false
+features = ["std"]
+
 [workspace.dependencies.clap]
 version = "4.6"
 default-features = false
@@ -510,7 +518,9 @@ version = "0.4"
 [workspace.dependencies.serde_json]
 version = "1.0"
 default-features = false
-features = ["raw_value"]
+# float_roundtrip: parse every number to the same double JavaScript does, so
+# the push guard's JSON.stringify byte count matches the clients' count.
+features = ["raw_value", "float_roundtrip"]
 
 [workspace.dependencies.serde_urlencoded]
 version = "0.7"

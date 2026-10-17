@@ -1,5 +1,6 @@
 mod append;
 mod badge;
+mod guard;
 mod notification;
 mod request;
 mod send;
@@ -34,8 +35,8 @@ use tuwunel_core::{
 use tuwunel_database::{Database, Deserialized, Ignore, Interfix, Json, Map};
 use url::Url;
 
-pub use self::append::Notified;
 use self::badge::SentBadges;
+pub use self::{append::Notified, guard::ACTIVITY_TTL_MS};
 
 /// The events an event relates to, keyed by relation type, for MSC3664.
 type RelatedEvents = BTreeMap<String, FlattenedJson>;
@@ -116,6 +117,7 @@ pub struct Service {
 	db: Data,
 	suppressed: suppressed::SuppressedQueue,
 	sent_badges: SentBadges,
+	guard: guard::Guard,
 }
 
 struct Data {
@@ -147,6 +149,7 @@ impl crate::Service for Service {
 			},
 			suppressed: suppressed::SuppressedQueue::default(),
 			sent_badges: SentBadges::default(),
+			guard: guard::Guard::default(),
 		}))
 	}
 
@@ -227,6 +230,7 @@ async fn set_pusher_post(
 	for owner in replaced_owners {
 		self.clear_suppressed_pushkey(&owner, pushkey);
 		self.forget_sent_badge(&owner, pushkey);
+		self.guard_forget_pusher(&owner, pushkey);
 		self.services
 			.sending
 			.cleanup_events(None, Some(&owner), Some(pushkey))
@@ -299,6 +303,7 @@ pub async fn delete_pusher(&self, sender: &UserId, pushkey: &str) {
 	self.db.pushkey_deviceid.remove(pushkey);
 	self.clear_suppressed_pushkey(sender, pushkey);
 	self.forget_sent_badge(sender, pushkey);
+	self.guard_forget_pusher(sender, pushkey);
 
 	self.services
 		.sending

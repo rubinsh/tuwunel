@@ -2,12 +2,13 @@ use std::{collections::HashSet, iter::once};
 
 use futures::{FutureExt, StreamExt};
 use ruma::{
-	OwnedEventId, OwnedServerName, RoomId, UserId,
+	EventId, OwnedEventId, OwnedServerName, RoomId, UserId,
 	events::{
 		TimelineEventType,
 		room::member::{MembershipState, RoomMemberEventContent},
 	},
 };
+use serde::Deserialize;
 use serde_json::value::to_raw_value;
 use tuwunel_core::{
 	Err, Result, implement,
@@ -39,6 +40,12 @@ pub async fn build_and_append_pdu(
 			.boxed()
 			.await?;
 	}
+
+	// Before the event exists: a rejected thread send must leave nothing
+	// stored and no unread counts behind.
+	self.check_thread_root(&pdu_builder, room_id)
+		.boxed()
+		.await?;
 
 	let (pdu, mut pdu_json) = self
 		.create_hash_and_sign_event(pdu_builder, sender, room_id, state_lock)
@@ -147,6 +154,56 @@ pub async fn build_and_append_pdu(
 		.await?;
 
 	Ok(pdu.event_id().to_owned())
+}
+
+/// A local send in a thread names a root that is already in this room's
+/// timeline. Appending checks the root only after the event is stored and
+/// counted, so an unknown root, or one from another room, is refused here.
+/// Federation and backfill don't come through this path.
+#[implement(super::Service)]
+#[tracing::instrument(skip_all, level = "debug")]
+async fn check_thread_root(&self, pdu_builder: &PduBuilder, room_id: &RoomId) -> Result {
+	#[derive(Deserialize)]
+	struct ExtractRelation {
+		#[serde(rename = "m.relates_to")]
+		relates_to: Option<Relation>,
+	}
+
+	#[derive(Deserialize)]
+	struct Relation {
+		rel_type: Option<String>,
+		event_id: Option<String>,
+	}
+
+	let Ok(ExtractRelation { relates_to: Some(relation) }) = pdu_builder
+		.content
+		.deserialize_as_unchecked::<ExtractRelation>()
+	else {
+		return Ok(());
+	};
+
+	if relation.rel_type.as_deref() != Some("m.thread") {
+		return Ok(());
+	}
+
+	let Some(root_id) = relation
+		.event_id
+		.as_deref()
+		.and_then(|id| EventId::parse(id).ok())
+	else {
+		return Err!(Request(InvalidParam("Thread relation has no valid root event_id.")));
+	};
+
+	let Ok(root_pdu_id) = self.get_pdu_id(&root_id).await else {
+		return Err!(Request(InvalidParam("Thread root not found.")));
+	};
+
+	let root = self.get_pdu_from_id(&root_pdu_id).await?;
+	if root.room_id() != room_id {
+		return Err!(Request(InvalidParam("Thread root is not in this room.")));
+	}
+
+	Ok(())
 }
 
 #[implement(super::Service)]

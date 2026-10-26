@@ -448,7 +448,9 @@ async fn quiet_arrivals_refresh_the_badge(fx: &Fixture<'_>) -> Result {
 		.get("userroomid_notificationcount")?;
 	let pusher = &fx.services.pusher;
 	let total_before = pusher.global_notification_count(&fx.user).await;
-	let room_before = pusher.notification_count(&fx.user, &fx.room).await;
+	let room_before = pusher
+		.notification_count(&fx.user, &fx.room)
+		.await;
 
 	for (arrived, id) in [(1_u64, "$quiet-badge-1:x"), (2, "$quiet-badge-2:x")] {
 		// What appending the message does to the reader's count.
@@ -794,7 +796,8 @@ fn expect_no_alert(gw: &mut Gateway, case: &str) -> Result {
 	loop {
 		match gw.rx.try_recv() {
 			| Err(TryRecvError::Empty) => return Ok(()),
-			| Err(TryRecvError::Disconnected) => return Err!("stub gateway closed during {case}"),
+			| Err(TryRecvError::Disconnected) =>
+				return Err!("stub gateway closed during {case}"),
 			| Ok(body) => {
 				let body: Value = serde_json::from_slice(&body)
 					.map_err(|e| err!("push body during {case} was not json: {e}"))?;

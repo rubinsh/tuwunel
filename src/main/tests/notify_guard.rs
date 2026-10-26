@@ -2,9 +2,9 @@
 
 //! The notification guard end to end: settings written through the client
 //! API as account data, activity reported through its endpoint, and pushes
-//! driven through the pusher service to stub gateways. A dropped notice
-//! returns `Ok(())` and never reaches the gateway; badge pushes are not
-//! guarded.
+//! driven through the pusher service to stub gateways. A dropped notice never
+//! reaches the gateway as an alert; it sends a counts-only badge refresh
+//! instead, which is not guarded and is not resent while the total holds.
 
 use std::{
 	env::var,
@@ -163,6 +163,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	bot_rooms_take_the_bot_room_default(&fx).await?;
 	large_bot_rooms(&fx).await?;
 	pause_and_quiet_hours(&fx).await?;
+	quiet_arrivals_refresh_the_badge(&fx).await?;
 	active_device_suppression(&fx).await?;
 	activity_endpoint_errors(&fx).await?;
 	deferred_flush_is_guarded(&fx).await
@@ -216,9 +217,9 @@ async fn burst_limits_alerts_per_room(fx: &Fixture<'_>) -> Result {
 	expect_delivered(&mut gw, "$burst-1:x")?;
 
 	fx.push(&gw, &second).await?;
-	expect_nothing(&mut gw, "a second alert inside the burst window")?;
+	expect_no_alert(&mut gw, "a second alert inside the burst window")?;
 	fx.push(&gw, &second).await?;
-	expect_nothing(&mut gw, "a retry of a dropped notice")
+	expect_no_alert(&mut gw, "a retry of a dropped notice")
 }
 
 /// A failed send keeps nothing: its retry alerts once, and while it has not
@@ -239,7 +240,7 @@ async fn failed_sends_keep_their_alert(fx: &Fixture<'_>) -> Result {
 
 	let later = fx.message("$retry-2:x", HUMAN, json!({ "body": "two" }));
 	fx.push(&gw, &later).await?;
-	expect_nothing(&mut gw, "an alert after the retried one, inside the window")?;
+	expect_no_alert(&mut gw, "an alert after the retried one, inside the window")?;
 
 	let mut gw = fx
 		.gateway("pk-release", device_id!("PHONE"), 1)
@@ -373,7 +374,7 @@ async fn large_bot_rooms(fx: &Fixture<'_>) -> Result {
 	let from_bot = |id: &str| message_in(&room, id, bots[0].as_str(), json!({ "body": "hi" }));
 
 	fx.push(&gw, &from_bot("$many-bots:x")).await?;
-	expect_nothing(&mut gw, "a plain message in a room of 65 listed bots")?;
+	expect_no_alert(&mut gw, "a plain message in a room of 65 listed bots")?;
 
 	let human = "notify-guard-test-human-access-token";
 	register(fx.services, "human", &[(device_id!("HUMAN"), human)]).await?;
@@ -420,6 +421,57 @@ async fn pause_and_quiet_hours(fx: &Fixture<'_>) -> Result {
 		.await
 }
 
+/// A message held back by quiet hours still moves the badge
+/// (rubinsh/matrix-bot-web-client#1521): the drop sends a counts-only push
+/// with the new total, an unchanged total is not sent again, and a pusher
+/// that turned its badge count off gets nothing.
+async fn quiet_arrivals_refresh_the_badge(fx: &Fixture<'_>) -> Result {
+	let quiet = json!({
+		"v": 1, "timezone": "UTC",
+		"quietHours": [{ "days": [0, 1, 2, 3, 4, 5, 6], "start": "00:00", "end": "00:00" }],
+	});
+	fx.settings("com.chat-harness.notify.schedule", quiet)
+		.await?;
+	let mut gw = fx
+		.gateway("pk-quiet-badge", device_id!("PHONE"), 0)
+		.await?;
+	let mut silent = fx
+		.gateway_with("pk-quiet-nobadge", device_id!("PHONE"), 0, |http| {
+			http.data
+				.insert("disable_badge_count".to_owned(), json!(true));
+		})
+		.await?;
+
+	let counts = fx
+		.services
+		.db
+		.get("userroomid_notificationcount")?;
+	let pusher = &fx.services.pusher;
+	let total_before = pusher.global_notification_count(&fx.user).await;
+	let room_before = pusher.notification_count(&fx.user, &fx.room).await;
+
+	for (arrived, id) in [(1_u64, "$quiet-badge-1:x"), (2, "$quiet-badge-2:x")] {
+		// What appending the message does to the reader's count.
+		counts.put((&fx.user, &fx.room), room_before.saturating_add(arrived));
+		let total = total_before.saturating_add(arrived);
+
+		let event = fx.message(id, OTHER_HUMAN, json!({ "body": "late" }));
+		fx.push(&gw, &event).await?;
+		expect_badge(&mut gw, id, total)?;
+
+		fx.push(&silent, &event).await?;
+		expect_nothing(&mut silent, "a quiet arrival for a pusher without a badge count")?;
+	}
+
+	let again = fx.message("$quiet-badge-3:x", OTHER_HUMAN, json!({ "body": "same" }));
+	fx.push(&gw, &again).await?;
+	expect_nothing(&mut gw, "a quiet drop that leaves the total unchanged")?;
+
+	counts.put((&fx.user, &fx.room), room_before);
+	fx.settings("com.chat-harness.notify.schedule", json!({}))
+		.await
+}
+
 /// While the PC views the room, the phone's pusher stays quiet for it, the
 /// PC's own pusher does not, and a clear lifts it.
 async fn active_device_suppression(fx: &Fixture<'_>) -> Result {
@@ -444,7 +496,7 @@ async fn active_device_suppression(fx: &Fixture<'_>) -> Result {
 
 	let event = fx.message("$active-on:x", HUMAN, json!({ "body": "hi" }));
 	fx.push(&phone, &event).await?;
-	expect_nothing(&mut phone, "the phone while the PC views the room")?;
+	expect_no_alert(&mut phone, "the phone while the PC views the room")?;
 	fx.push(&pc, &event).await?;
 	expect_delivered(&mut pc, "$active-on:x")?;
 
@@ -501,7 +553,7 @@ async fn deferred_flush_is_guarded(fx: &Fixture<'_>) -> Result {
 		.sending
 		.flush_suppressed_for_user(fx.user.clone(), "guard test")
 		.await;
-	expect_nothing(&mut gw, "a flushed push in a muted room")?;
+	expect_no_alert(&mut gw, "a flushed push in a muted room")?;
 
 	fx.settings("com.chat-harness.notify.rooms", json!({}))
 		.await?;
@@ -560,7 +612,7 @@ impl Fixture<'_> {
 
 		match alerts {
 			| true => expect_delivered(gw, event_id),
-			| false => expect_nothing(gw, event_id),
+			| false => expect_no_alert(gw, event_id),
 		}
 	}
 
@@ -641,12 +693,26 @@ impl Fixture<'_> {
 		device: &DeviceId,
 		failures: usize,
 	) -> Result<Gateway> {
+		self.gateway_with(pushkey, device, failures, |_| {})
+			.await
+	}
+
+	/// The same, with the pusher's data adjusted first.
+	async fn gateway_with(
+		&self,
+		pushkey: &str,
+		device: &DeviceId,
+		failures: usize,
+		adjust: impl FnOnce(&mut HttpPusherData),
+	) -> Result<Gateway> {
 		let listener = TcpListener::bind("127.0.0.1:0").await?;
 		let url = format!("http://{}/_matrix/push/v1/notify", listener.local_addr()?);
+		let mut http = HttpPusherData::new(url);
+		adjust(&mut http);
 
 		let pusher: Pusher = PusherInit {
 			ids: PusherIds::new(pushkey.to_owned(), APP_ID.to_owned()),
-			kind: PusherKind::Http(HttpPusherData::new(url)),
+			kind: PusherKind::Http(http),
 			app_display_name: "Guard Test".into(),
 			device_display_name: "Guard Device".into(),
 			profile_tag: None,
@@ -702,6 +768,42 @@ fn expect_delivered(gw: &mut Gateway, event_id: &str) -> Result {
 	}
 
 	expect_nothing(gw, event_id)
+}
+
+/// A counts-only push carrying `unread`, and nothing else.
+fn expect_badge(gw: &mut Gateway, case: &str, unread: u64) -> Result {
+	let body = recv(&mut gw.rx, case)?;
+	let body: Value = serde_json::from_slice(&body)
+		.map_err(|e| err!("push body for {case} was not json: {e}"))?;
+
+	let notification = &body["notification"];
+	if !notification["event_id"].is_null() {
+		return Err!("{case}: expected a badge-only push, got an alert {body}");
+	}
+
+	let got = notification["counts"]["unread"].as_u64();
+	if got != Some(unread) {
+		return Err!("{case}: expected a badge of {unread}, got {got:?} in {body}");
+	}
+
+	expect_nothing(gw, case)
+}
+
+/// No alert. A dropped notice may still send its counts-only badge refresh.
+fn expect_no_alert(gw: &mut Gateway, case: &str) -> Result {
+	loop {
+		match gw.rx.try_recv() {
+			| Err(TryRecvError::Empty) => return Ok(()),
+			| Err(TryRecvError::Disconnected) => return Err!("stub gateway closed during {case}"),
+			| Ok(body) => {
+				let body: Value = serde_json::from_slice(&body)
+					.map_err(|e| err!("push body during {case} was not json: {e}"))?;
+				if !body["notification"]["event_id"].is_null() {
+					return Err!("{case}: unexpected alert {body}");
+				}
+			},
+		}
+	}
 }
 
 fn expect_nothing(gw: &mut Gateway, case: &str) -> Result {

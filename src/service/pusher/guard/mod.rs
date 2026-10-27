@@ -4,7 +4,9 @@
 //! push rules decide to notify and before the gateway is called, so it sees
 //! every alert, including the flush of deferred pushes. Badge-only pushes and
 //! unread counts never pass through it. A drop is final for that pusher and
-//! event: it returns `Ok(())`, so nothing retries it. The guard fails open: a
+//! event: no alert is sent and nothing retries it. In its place the pusher
+//! gets a counts-only refresh, so the badge still follows the arrival. The
+//! guard fails open: a
 //! setting it cannot read falls back to the defaults, which deliver as the
 //! server did before the guard existed.
 

@@ -71,7 +71,9 @@ where
 	}
 
 	let Verdict::Send { burst } = self.guard_notice(user_id, pusher, event).await else {
-		return Ok(());
+		// The alert is held back, but the arrival still counts: the badge moves
+		// as it would have with the alert. An unchanged total is not resent.
+		return self.send_badge_notice(user_id, pusher).await;
 	};
 
 	let tweaks: Vec<Tweak> = actions
